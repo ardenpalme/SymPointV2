@@ -1,6 +1,3 @@
-
-
-
 import argparse
 import yaml
 from munch import Munch
@@ -54,10 +51,11 @@ def main():
             offset = torch.IntTensor(offset)
             coords,feats,labels = torch.FloatTensor(coords), torch.FloatTensor(feats), torch.LongTensor(labels)
             batch = (coords,feats,labels,offset, torch.FloatTensor(lengths),layerIds)
+            print(batch[-1] if isinstance(batch, (list,tuple)) else "", batch[0].shape)
             
             torch.cuda.empty_cache()
             
-            with torch.cuda.amp.autocast(enabled=cfg.fp16):
+            with torch.amp.autocast('cuda', enabled=cfg.fp16):
                 t1 = time.time()
                 res = model(batch,return_loss=False)
                 t2 = time.time()

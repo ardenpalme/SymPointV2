@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,7 +16,6 @@ from svgnet.data import build_dataloader, build_dataset
 from svgnet.evaluation import PointWiseEval,InstanceEval
 from svgnet.model.svgnet import SVGNet as svgnet
 from svgnet.util  import get_root_logger, init_dist, load_checkpoint
-
 
 def get_args():
     parser = argparse.ArgumentParser("svgnet")
@@ -66,6 +66,7 @@ def main():
     args = get_args()
     cfg_txt = open(args.config, "r").read()
     cfg = Munch.fromDict(yaml.safe_load(cfg_txt))
+    print(">>>ASFASFSAFASF", Path(cfg.data.test.data_root).absolute())
     if args.dist:
         init_dist()
     logger = get_root_logger()
@@ -98,7 +99,7 @@ def main():
                 step = int(len(val_set)/gpu_num)
                 logger.info(f"Infer  {i+1}/{step}")
             torch.cuda.empty_cache()
-            with torch.cuda.amp.autocast(enabled=cfg.fp16):
+            with torch.amp.autocast('cuda', enabled=cfg.fp16):
                 res = model(batch,return_loss=False)
             
             t2 = time.time()

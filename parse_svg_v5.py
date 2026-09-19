@@ -1,4 +1,4 @@
-
+import argparse
 import math,re
 import os,glob,json
 import xml.etree.ElementTree as ET
@@ -6,15 +6,11 @@ from svgpathtools import parse_path
 from collections import defaultdict
 import numpy as np
 from sklearn.metrics.pairwise import euclidean_distances
+import mmcv
 
 LABEL_NUM = 35
 COMMANDS = ['Line', 'Arc','circle', 'ellipse']
-import mmcv
-
-data_dir = './dataset/svg/val/'
-svg_paths = sorted(glob.glob(os.path.join(data_dir,'*.svg')))
-save_dir = data_dir
-os.makedirs(save_dir,exist_ok=True)
+DATA_DIR = './dataset/FloorplanCAD/'
 
 def parse_svg(svg_file):
     tree = ET.parse(svg_file)
@@ -150,24 +146,16 @@ def parse_svg(svg_file):
     return json_dicts
 
 def save_json(json_dicts,out_json):
-    json.dump(json_dicts, open(out_json, 'w'), indent=4)
+    json.dump(json_dicts, open(out_json, 'w'), indent=2)
     
 def process(svg_file):
-    
     json_dicts = parse_svg(svg_file)
-    filename = svg_file.split("/")[-1].replace(".svg","_s2.json")
-    out_json = os.path.join(save_dir,filename)
+    out_json = svg_file.replace(".svg","_s2.json")
     save_json(json_dicts,out_json)
 
 if __name__=="__main__":
-    
+    p = argparse.ArgumentParser(description="Parse SVG splits")
+    p.add_argument("--split", required=True, choices=["train", "val", "test"])
+    args = p.parse_args()
+    svg_paths = sorted(glob.glob(os.path.join(DATA_DIR, args.split, '*.svg')))
     mmcv.track_parallel_progress(process,svg_paths,64)
-
-
-    
-
-
-    
-            
-            
-            

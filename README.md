@@ -11,12 +11,17 @@
 We recommend users to use `conda` to install the running environment. The following dependencies are required:
 
 ```bash
-conda create -n spv1 python=3.8 -y
+conda init
+conda create -n spv1 python=3.9 -y
 conda activate spv1
+conda install -y -c conda-forge ninja
+conda install -y -c nvidia/label/cuda-13.0.0 cuda-toolkit
 
-pip install torch==1.10.0+cu111 torchvision==0.11.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html
-pip install gdown mmcv==0.2.14 svgpathtools==1.6.1 munch==2.5.0 tensorboard==2.12.0 tensorboardx==2.5.1 detectron2==0.6
-python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
+pip install torch torchvision torchaudio
+pip install gdown mmcv==0.2.14 svgpathtools==1.6.1 munch==2.5.0 tensorboard==2.12.0 tensorboardx==2.5.1 
+
+git clone https://github.com/facebookresearch/detectron2.git && cd detectron2 
+python -m pip install .
 
 # compile pointops
 cd modules/pointops
@@ -29,7 +34,7 @@ download dataset from floorplan website, and convert it to json format data for 
 
 ```python
 # download dataset
-python download_data.py
+python dataset/download_data.py
 # preprocess
 #train, val, test
 python parse_svg.py --split train --data_dir ./dataset/train/train/svg_gt/

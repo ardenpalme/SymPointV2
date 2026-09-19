@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from .position_embedding import PositionEmbeddingCoordsSine
 from .basic_operators import get_subscene_features
 from .dn_query import CDNQueries
@@ -144,7 +144,7 @@ class Decoder(nn.Module):
             coords_batch = coords[i]
             scene_min = coords_batch.min(dim=0)[0][None, ...]
             scene_max = coords_batch.max(dim=0)[0][None, ...]
-            with autocast(enabled=False):
+            with autocast('cuda', enabled=False):
                 tmp = self.pos_enc(coords_batch[None, ...].float(),
                                        input_range=[scene_min, scene_max])
                 pos_encodings_pcd.append(tmp.permute(2,0,1))

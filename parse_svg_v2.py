@@ -11,7 +11,7 @@ LABEL_NUM = 35
 COMMANDS = ['Line', 'Arc','circle', 'ellipse']
 import mmcv
 
-data_dir = './dataset/svg/test/'
+data_dir = './dataset/FloorPlanCAD/test/'
 svg_paths = sorted(glob.glob(os.path.join(data_dir,'*.svg')))
 save_dir = data_dir
 os.makedirs(save_dir,exist_ok=True)
