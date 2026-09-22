@@ -3,3 +3,4 @@ spv2-rep.zip
 dataset/FloorplanCAD
 svgnet/__pycache__/
 modules/
+detectron2/

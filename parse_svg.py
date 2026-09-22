@@ -1,20 +1,16 @@
-
-import math
+import argparse
+import math,re
 import os,glob,json
 import xml.etree.ElementTree as ET
 from svgpathtools import parse_path
 from collections import defaultdict
 import numpy as np
 from sklearn.metrics.pairwise import euclidean_distances
+import mmcv
 
 LABEL_NUM = 35
 COMMANDS = ['Line', 'Arc','circle', 'ellipse']
-import mmcv
-
-data_dir = './dataset/FloorPlanCAD/test/'
-svg_paths = sorted(glob.glob(os.path.join(data_dir,'*.svg')))
-save_dir = data_dir
-os.makedirs(save_dir,exist_ok=True)
+DATA_DIR = './dataset/FloorplanCAD/'
 
 def parse_svg(svg_file):
     tree = ET.parse(svg_file)
@@ -23,12 +19,17 @@ def parse_svg(svg_file):
     minx, miny, width, height = [int(float(x)) for x in root.attrib['viewBox'].split(' ')]
     
     commands = []
-    args = [] # (x1,y1,x2,y2,x3,y3,x4,y4) 4points
+    args = [] # (x1,y1,x2,y2,x3,y3,x4,y4) each primitive smapled at 4 points
     lengths = []
     semanticIds = []
     instanceIds = []
+    strokes = []
+    layerIds = []
+    widths = []
     inst_infos = defaultdict(list)
+    id = 0
     for g in root.iter(ns + 'g'):
+        id +=1
         # path
         for path in g.iter(ns + 'path'):
             try:
@@ -36,30 +37,30 @@ def parse_svg(svg_file):
             except Exception as e:
                 raise RuntimeError("Parse path failed!{}, {}".format(svg_file, path.attrib['d']))
             
-             
             path_type = path_repre[0].__class__.__name__
             commands.append(COMMANDS.index(path_type))
             length = path_repre.length()
             lengths.append(length)
-            
+            layerIds.append(id)
             semanticId = int(path.attrib['semanticId']) - 1 if 'semanticId' in path.attrib else LABEL_NUM
             instanceId = int(path.attrib['instanceId']) if 'instanceId' in path.attrib else -1
             semanticIds.append(semanticId)
             instanceIds.append(instanceId)
-            
-            
+            rgb = list(map(int,re.findall(r'\d+',path.attrib['stroke'])))  # parses stroke="rgb(255, 0, 0)"
+            strokes.append(rgb)
+            widths.extend([float(path.attrib["stroke-width"])])
             inds = [0, 1/3, 2/3, 1.0]
             arg = []
+            # sample the path at normalized lengths
             for ind in inds:
-                point = path_repre.point(ind)
-                arg.extend([point.real,point.imag])
+                point = path_repre.point(ind)      
+                arg.extend([point.real,point.imag]) # (x,y)
             args.append(arg)
             inst_infos[(instanceId,semanticId)].extend(arg)
             
         
         # circle
         for circle in g.iter(ns + 'circle'):
-             
             cx = float(circle.attrib['cx'])
             cy = float(circle.attrib['cy'])
             r = float(circle.attrib['r'])
@@ -70,8 +71,11 @@ def parse_svg(svg_file):
             semanticIds.append(semanticId)
             instanceIds.append(instanceId)
             commands.append(COMMANDS.index("circle"))
-            
-            thetas = [0,math.pi/2, math.pi, 3 * math.pi/2,]
+            layerIds.append(id)
+            rgb = list(map(int,re.findall(r'\d+',circle.attrib['stroke'])))
+            strokes.append(rgb)
+            widths.extend([float(circle.attrib["stroke-width"])])
+            thetas = [0, math.pi/2, math.pi, 3*(math.pi/2)]
             arg = []
             for theta in thetas:
                 x, y = cx + r * math.cos(theta), cy + r * math.sin(theta)
@@ -88,17 +92,19 @@ def parse_svg(svg_file):
             
             semanticId = int(ellipse.attrib['semanticId']) - 1 if 'semanticId' in ellipse.attrib else LABEL_NUM
             instanceId = int(ellipse.attrib['instanceId']) if 'instanceId' in ellipse.attrib else -1
-            if rx>ry: 
-                a,b = rx, ry
-            else:
-                a,b = ry, rx
-            ellipse_len = 2* math.pi *b + 4*(a - b)
+            if rx>ry: a,b = rx, ry
+            else: a,b = ry, rx
+            h = math.pow(a-b,2) / math.pow(a+b,2)
+            ellipse_len = math.pi * (a+b) * (1 + ((3*h)/(10+math.sqrt(4-(3*h))))) # Ramanujan 2nd order approx
             lengths.append(ellipse_len)
             commands.append(COMMANDS.index("ellipse"))
             semanticIds.append(semanticId)
             instanceIds.append(instanceId)
-            
-            thetas = [0,math.pi/2, math.pi, 3 * math.pi/2,]
+            layerIds.append(id)
+            rgb = list(map(int,re.findall(r'\d+',ellipse.attrib['stroke'])))
+            strokes.append(rgb)
+            widths.extend([float(ellipse.attrib["stroke-width"])])
+            thetas = [0, math.pi/2, math.pi, 3*(math.pi/2)]
             arg = []
             for theta in thetas:
                 x, y = cx + a * math.cos(theta), cy + b * math.sin(theta)
@@ -106,25 +112,24 @@ def parse_svg(svg_file):
             args.append(arg)
             inst_infos[(instanceId,semanticId)].extend(arg)
             
-        
-            
     assert len(args) == len(lengths) ,'error'
     assert len(semanticIds) ==  len(instanceIds), 'error'
     obj_cts = []
     obj_boxes = []
-    for (inst_id, sem_id),coords in inst_infos.items():
-        if inst_id<0: continue
+    for (inst_id, sem_id), coords in inst_infos.items():
+        if inst_id<0: continue # does this ignore "stuff"
         coords = np.array(coords).reshape(-1,2)
         x1,y1 = np.min(coords[:,0]), np.min(coords[:,1])
         x2,y2 = np.max(coords[:,0]), np.max(coords[:,1])
-        obj_cts.append([(x1+x2)/2,(y1+y2)/2,0,inst_id])
-        obj_boxes.append([x1,y1,x2,y2,sem_id])
+        obj_cts.append([(x1+x2)/2,(y1+y2)/2,0,inst_id]) # center tied to instance ID
+        obj_boxes.append([x1,y1,x2,y2,sem_id]) # bbox tied to semantic ID
     
     coords = np.array(args).reshape(-1,4,2)
-    neighbors = calc_closedpoint_inds(coords)
+   
     json_dicts = {
         "commands":commands,
-        "args":args,
+        #"args":args,
+        "coords": coords,
         "lengths":lengths,
         "semanticIds":semanticIds,
         "instanceIds":instanceIds,
@@ -132,52 +137,21 @@ def parse_svg(svg_file):
         "height":height,
         "obj_cts": obj_cts, #(x,y,z)
         "boxes": obj_boxes,
-        "neighbors": neighbors,
+        "rgb": strokes,
+        "layerIds":layerIds,
+        "widths": widths
     }
     return json_dicts
 
-
-def calc_closedpoint_inds(coords, minv=1,max_degree=16):
-    
-    start_points, end_points = coords[:,0,:], coords[:,-1,:]
-    lines = np.concatenate([start_points[:,None,:],
-                        end_points[:,None,:]],axis=1)
-    neighbors = []
-    for i,line in enumerate(lines):  
-        _closed = np.full_like(np.zeros(max_degree),i)
-        self_ind = [i*2, i*2 + 1]
-        sim = euclidean_distances(line,lines.reshape(-1,2))
-        t = 0
-        for j,_sim in enumerate(sim):
-            ind = np.where(_sim<minv)[0]
-            sid = _sim[ind].argsort()[:max_degree//2]
-            sind = ind[sid]
-            for id in sind:
-                if id in self_ind: continue
-                _closed[t] = id //2
-                t += 1
-        neighbors.append(_closed.tolist())
-    return neighbors
-
-
-def save_json(json_dicts,out_json):
-    json.dump(json_dicts, open(out_json, 'w'), indent=4)
-    
 def process(svg_file):
-    
     json_dicts = parse_svg(svg_file)
-    filename = svg_file.split("/")[-1].replace(".svg","_neighbor.json")
-    out_json = os.path.join(save_dir,filename)
-    save_json(json_dicts,out_json)
+    out_json = svg_file.replace(".svg","_s2.json")
+    json.dump(json_dicts, open(out_json, 'w'), indent=2)
 
 if __name__=="__main__":
-    mmcv.track_parallel_progress(process,svg_paths,64)
-
-
-    
-
-
-    
-            
-            
-            
+    p = argparse.ArgumentParser(description="Parse FloorPlanCAD Dataset (labeled .svg files) train/val/test splits")
+    p.add_argument("--split", required=True, choices=["train", "val", "test"])
+    p.add_argument("--nproc", default=64, description="number of parallel worker processes")
+    args = p.parse_args()
+    svg_paths = sorted(glob.glob(os.path.join(DATA_DIR, args.split, '*.svg')))
+    mmcv.track_parallel_progress(process,svg_paths,args.nproc)

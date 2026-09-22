@@ -36,8 +36,6 @@ from svgnet.util import (
     build_new_optimizer
 )
 
-
-
 def get_args():
     parser = argparse.ArgumentParser("svgnet")
     parser.add_argument("config", type=str, help="path to config file")
@@ -52,7 +50,6 @@ def get_args():
     
     args = parser.parse_args()
     return args
-
 
 def train(epoch, model, optimizer, scheduler, scaler, train_loader, cfg, logger, writer):
     model.train()
