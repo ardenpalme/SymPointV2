@@ -54,6 +54,10 @@ SVG_CATEGORIES = [
     {"color": [64, 52, 105], "isthing": 0, "id": 35, "name": "railing"},
     {"color": [0, 0, 0], "isthing": 0, "id": 36, "name": "bg"},
 ]
+
+BG_SEM_ID = 36
+BG_INS_ID = -1
+
 def angles_with_horizontal(coords):
     coords = np.array(coords).reshape(-1,4,2)
     start_points, end_points = coords[:,0,:], coords[:,-1,:]
@@ -89,7 +93,7 @@ class SVGDataset(Dataset):
     def load(json_file,idx,min_points=2048):
         data = json.load(open(json_file))
         width, height = data["width"], data["height"]
-        coords = data["args"]
+        coords = data["coords"]
         arcs = angles_with_horizontal(coords)
         coords = np.array(coords).reshape(-1,8)
         coords[:, 0::2] = coords[:, 0::2] / width
@@ -266,3 +270,177 @@ class SVGDataset(Dataset):
         lengths = torch.cat(lengths) if lengths[0] is not None else None
         return torch.cat(coord), torch.cat(feat), torch.cat(label), torch.IntTensor(offset),lengths,torch.cat(layerIds)
   
+
+class PDFDataset(Dataset):
+
+    CLASSES = tuple([x["name"] for x in SVG_CATEGORIES])
+
+    def __init__(self, data_root, split, data_norm, aug=None, repeat=1,
+                 min_points=2048, logger=None):
+        self.split = split
+        self.data_norm = data_norm
+        self.aug = aug
+        self.repeat = repeat
+        self.min_points = int(min_points)
+
+        self.data_list = sorted(glob(osp.join(data_root, split, "*_s2.npz")))
+        if logger is not None:
+            logger.info(f"Load {split} dataset: {len(self.data_list)} npz")
+        self.data_idx = np.arange(len(self.data_list))
+        self.instance_queues = []
+
+    def __len__(self):
+        return len(self.data_list) * self.repeat
+
+    @staticmethod
+    def load(npz_file, idx, min_points=2048):
+        z = np.load(npz_file, allow_pickle=False)
+
+        width  = int(z["width"])
+        height = int(z["height"])
+        coords = z["coords"].astype(np.float32)          # (N, 8)
+        num    = coords.shape[0]
+        max_num = max(num, min_points)
+
+        # angles + normalized coords
+        arcs = angles_with_horizontal(coords)            # (N,)
+
+        coords_n = coords.copy()
+        coords_n[:, 0::2] /= width
+        coords_n[:, 1::2] /= height
+
+        coord = np.zeros((max_num, 3), dtype=np.float32)
+        coord[:num, 0] = coords_n[:, 0::2].mean(axis=1)
+        coord[:num, 1] = coords_n[:, 1::2].mean(axis=1)
+
+        lengths = np.zeros(max_num, dtype=np.float32)
+        lengths_raw = z["lengths"].astype(np.float32)
+        lengths[:num] = lengths_raw
+
+        feat = np.zeros((max_num, 7), dtype=np.float32)
+        max_dim = max(width, height)
+        feat[:num, 0] = arcs
+        feat[:num, 1] = np.clip(lengths_raw, 0, max_dim) / max_dim
+        commands = z["commands"].astype(np.int64)
+        feat[:num, 2:6] = np.eye(4, dtype=np.float32)[commands]
+        widths = z["widths"].astype(np.float32)
+        feat[:num, 6] = widths / max(widths.max(), 1e-8)
+
+        # labels
+        semanticIds = np.full(max_num, BG_SEM_ID, dtype=np.int64)
+        semanticIds[:num] = z["semanticIds"].astype(np.int64)
+
+        instanceIds = np.full(max_num, BG_INS_ID, dtype=np.int64)
+        ins = z["instanceIds"].astype(np.int64)
+        valid_pos = ins != -1
+        ins[valid_pos] += idx * min_points
+        instanceIds[:num] = ins
+
+        label = np.stack([semanticIds, instanceIds], axis=1)
+
+        # layers
+        layerIds = z["layerIds"].astype(np.int64)
+        bg_layerId = int(layerIds.max()) + 1 if num > 0 else 0
+        pad_layerIds = np.full(max_num, bg_layerId, dtype=np.int64)
+        pad_layerIds[:num] = layerIds
+        pad_layerIds += idx * min_points
+
+        return coord, feat, label, lengths, pad_layerIds
+
+    def __getitem__(self, idx):
+        data_idx = self.data_idx[idx % len(self.data_idx)]
+        npz_file = self.data_list[data_idx]
+        coord, feat, label, lengths, layerIds = PDFDataset.load(npz_file, idx, min_points=self.min_points)
+        if self.split == "train":
+            return self.transform_train(coord, feat, label, layerIds)
+        return self.transform_test(coord, feat, label, lengths, layerIds)
+
+    def transform_train(self, coord, feat, label, layerIds):
+        if self.aug is None:
+            return self.transform_test(coord, feat, label, None, layerIds)
+
+        if self.aug.hflip and np.random.rand() < self.aug.aug_prob:
+            coord[:, :2] = RandomHorizonFilp(coord[:, :2], width=1)
+        if self.aug.vflip and np.random.rand() < self.aug.aug_prob:
+            coord[:, :2] = RandomVerticalFilp(coord[:, :2], Hight=1)
+        if self.aug.rotate.enable and np.random.rand() < self.aug.aug_prob:
+            _min, _max = self.aug.rotate.angle
+            angle = random.uniform(_min, _max)
+            coord[:, :2] = rotate_xy(coord[:, :2], width=1, height=1, angle=angle)
+        if self.aug.rotate2 and np.random.rand() < self.aug.aug_prob:
+            coord[:, :2] = random_rotate(coord[:, :2], width=1, height=1)
+        if self.aug.shift.enable and np.random.rand() < self.aug.aug_prob:
+            _min, _max = self.aug.shift.scale
+            scale = np.random.uniform(_min, _max, 3)
+            scale[2] = 0
+            coord += scale
+        if self.aug.scale.enable and np.random.rand() < self.aug.aug_prob:
+            _min, _max = self.aug.scale.ratio
+            scale = np.random.uniform(_min, _max, 1)
+            coord *= scale
+            feat[:, 1] = feat[:, 1] * scale
+
+        mix_coord, mix_feat, mix_label, mix_layerid = [coord], [feat], [label], [layerIds]
+
+        if self.aug.cutmix.enable and np.random.rand() < self.aug.aug_prob:
+            unique_label = np.unique(label, axis=0)
+            for sem, ins in unique_label:
+                if sem >= 30:
+                    continue
+                valid = np.logical_and(label[:, 0] == sem, label[:, 1] == ins)
+                if len(self.instance_queues) <= self.aug.cutmix.queueK:
+                    self.instance_queues.insert(0, {
+                        "coord": coord[valid],
+                        "feat": feat[valid],
+                        "label": label[valid],
+                        "layerid": layerIds[valid],
+                    })
+                else:
+                    self.instance_queues.pop()
+            _min, _max = self.aug.cutmix.relative_shift
+            rand_pos = np.random.uniform(_min, _max, 3)
+            rand_pos[2] = 0
+            for inst in self.instance_queues:
+                mix_coord.append(inst["coord"] + rand_pos)
+                mix_feat.append(inst["feat"])
+                mix_label.append(inst["label"])
+                mix_layerid.append(inst["layerid"])
+
+        coord = np.concatenate(mix_coord, axis=0)
+        feat = np.concatenate(mix_feat, axis=0)
+        label = np.concatenate(mix_label, axis=0)
+        mix_layerid = np.concatenate(mix_layerid)
+
+        shuf = np.arange(coord.shape[0])
+        np.random.shuffle(shuf)
+        coord, feat = coord[shuf], feat[shuf]
+        label = label[shuf]
+        mix_layerid = mix_layerid[shuf]
+
+        if self.data_norm == 'mean':
+            coord -= np.mean(coord, 0)
+        elif self.data_norm == 'min':
+            coord -= np.min(coord, 0)
+
+        return (torch.FloatTensor(coord), torch.FloatTensor(feat),
+                torch.LongTensor(label), None, torch.LongTensor(mix_layerid))
+
+    def transform_test(self, coord, feat, label, lengths, layerIds):
+        if self.data_norm == 'mean':
+            coord -= np.mean(coord, 0)
+        elif self.data_norm == 'min':
+            coord -= np.min(coord, 0)
+        return (torch.FloatTensor(coord), torch.FloatTensor(feat),
+                torch.LongTensor(label),
+                torch.FloatTensor(lengths) if lengths is not None else None,
+                torch.LongTensor(layerIds))
+
+    def collate_fn(self, batch):
+        coord, feat, label, lengths, layerIds = list(zip(*batch))
+        offset, count = [], 0
+        for item in coord:
+            count += item.shape[0]
+            offset.append(count)
+        lengths = torch.cat(lengths) if lengths[0] is not None else None
+        return (torch.cat(coord), torch.cat(feat), torch.cat(label),
+                torch.IntTensor(offset), lengths, torch.cat(layerIds))

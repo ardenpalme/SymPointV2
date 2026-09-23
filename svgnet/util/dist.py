@@ -22,10 +22,10 @@ def get_dist_info():
 
 
 def init_dist(backend="nccl", **kwargs):
-    rank = int(os.environ["RANK"])
+    rank = int(os.environ["RANK"]) # global rank of current process (set by torchrun)
     # world_size = int(os.environ["WORLD_SIZE"])
-    num_gpus = torch.cuda.device_count()
-    torch.cuda.set_device(rank % num_gpus)
+    num_gpus = torch.cuda.device_count() # number of avail GPUs for current process
+    torch.cuda.set_device(rank % num_gpus) # assign current process to specific GPU (modulo is for many machines)
     dist.init_process_group(backend=backend, **kwargs)
     # dist.init_process_group(backend=backend, init_method='tcp://127.0.0.1:54411', world_size=world_size, rank=rank)
     return rank

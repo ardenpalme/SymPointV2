@@ -6,11 +6,10 @@ from svgpathtools import parse_path
 from collections import defaultdict
 import numpy as np
 from sklearn.metrics.pairwise import euclidean_distances
-import mmcv
+from mmengine.utils import track_parallel_progress
 
 LABEL_NUM = 35
 COMMANDS = ['Line', 'Arc','circle', 'ellipse']
-DATA_DIR = './dataset/FloorplanCAD/'
 
 def parse_svg(svg_file):
     tree = ET.parse(svg_file)
@@ -117,7 +116,7 @@ def parse_svg(svg_file):
     obj_cts = []
     obj_boxes = []
     for (inst_id, sem_id), coords in inst_infos.items():
-        if inst_id<0: continue # does this ignore "stuff"
+        if inst_id<0: continue # ignores "stuff"
         coords = np.array(coords).reshape(-1,2)
         x1,y1 = np.min(coords[:,0]), np.min(coords[:,1])
         x2,y2 = np.max(coords[:,0]), np.max(coords[:,1])
@@ -128,8 +127,7 @@ def parse_svg(svg_file):
    
     json_dicts = {
         "commands":commands,
-        #"args":args,
-        "coords": coords,
+        "coords": coords.tolist(),
         "lengths":lengths,
         "semanticIds":semanticIds,
         "instanceIds":instanceIds,
@@ -151,7 +149,8 @@ def process(svg_file):
 if __name__=="__main__":
     p = argparse.ArgumentParser(description="Parse FloorPlanCAD Dataset (labeled .svg files) train/val/test splits")
     p.add_argument("--split", required=True, choices=["train", "val", "test"])
-    p.add_argument("--nproc", default=64, description="number of parallel worker processes")
+    p.add_argument("--nproc", required=True)
+    p.add_argument("--data", required=True)
     args = p.parse_args()
-    svg_paths = sorted(glob.glob(os.path.join(DATA_DIR, args.split, '*.svg')))
-    mmcv.track_parallel_progress(process,svg_paths,args.nproc)
+    svg_paths = sorted(glob.glob(os.path.join(args.data, args.split, '*.svg')))
+    track_parallel_progress(process,svg_paths,int(args.nproc))

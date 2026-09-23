@@ -66,7 +66,6 @@ def main():
     args = get_args()
     cfg_txt = open(args.config, "r").read()
     cfg = Munch.fromDict(yaml.safe_load(cfg_txt))
-    print(">>>ASFASFSAFASF", Path(cfg.data.test.data_root).absolute())
     if args.dist:
         init_dist()
     logger = get_root_logger()

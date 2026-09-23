@@ -3,7 +3,7 @@ from torch.utils.data.distributed import DistributedSampler
 from functools import partial
 
 from svgnet.util import worker_init_fn
-from .svg3 import SVGDataset
+from .svg3 import PDFDataset, SVGDataset
 __all__ = ["SVGDataset", "build_dataset"]
 
 
@@ -15,6 +15,9 @@ def build_dataset(data_cfg, logger):
     
     if data_type == "svg":
         return SVGDataset(**_data_cfg)
+    if data_type == "pdf":
+        return PDFDataset(**_data_cfg)
+
     else:
         raise ValueError(f"Unknown {data_type}")
 

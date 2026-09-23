@@ -1,8 +1,10 @@
-from tensorboardX import SummaryWriter as _SummaryWriter
+'''
+For a distributed training setup, only the main process should write logs and TensorBoard events
+'''
 
+from tensorboardX import SummaryWriter as _SummaryWriter
 import logging
 from .dist import is_main_process, master_only
-
 
 def get_root_logger(log_file=None, log_level=logging.INFO):
     logger = logging.getLogger("isbnet")
@@ -22,6 +24,7 @@ def get_root_logger(log_file=None, log_level=logging.INFO):
     return logger
 
 
+# Ensures only the master (rank=0) GPU writes TensorBoard summaries
 class SummaryWriter(_SummaryWriter):
     @master_only
     def __init__(self, *args, **kwargs):

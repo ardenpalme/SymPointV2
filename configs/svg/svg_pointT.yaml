@@ -47,7 +47,7 @@ criterion:
 data:
   train:
     type: 'svg'
-    data_root: 'dataset/svg'
+    data_root: 'dataset/FloorplanCAD'
     repeat: 5
     split: "train"
     data_norm: "mean"

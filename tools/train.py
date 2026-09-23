@@ -166,9 +166,10 @@ def main():
 
     if args.dist:
         rank = init_dist()
-    set_seed(args.seed + rank)    
+        set_seed(args.seed + rank)    
+    else:
+        set_seed(args.seed)    
     cfg.dist = args.dist
-    
 
     # work_dir & logger
     if args.work_dir:
@@ -187,21 +188,23 @@ def main():
     logger.info(f"Mix precision training: {cfg.fp16}")
     shutil.copy(args.config, osp.join(cfg.work_dir, osp.basename(args.config)))
     writer = SummaryWriter(cfg.work_dir)
-
     logger.info(f"Save at: {cfg.work_dir}")
 
     # criterion
     matcher = HungarianMatcher(**cfg.matcher)
     weight_dict = {
-            "loss_ce": cfg.matcher.cost_class, 
-            "loss_mask": cfg.matcher.cost_mask, 
-            "loss_dice": cfg.matcher.cost_dice,
-            }
+        "loss_ce": cfg.matcher.cost_class, 
+        "loss_mask": cfg.matcher.cost_mask,
+        "loss_dice": cfg.matcher.cost_dice,
+    }
     criterion = SetCriterion(matcher,weight_dict,cfg.criterion).cuda()
     
     model = svgnet(cfg.model, criterion=criterion).cuda()
     if args.sync_bn:
-            nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            # converts nn.BatchNorm{1|3}d to nn.SyncBatchNorm
+            # allows GPUs to share statistics (as if 1 big batch)
+            nn.SyncBatchNorm.convert_sync_batchnorm(model) 
+            
     #logger.info(model)
     
     total_params = 0
