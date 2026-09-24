@@ -17,6 +17,7 @@ from svgnet.data.svg3 import PDFDataset, SVGDataset, SVG_CATEGORIES
 from svgnet.util import get_root_logger, load_checkpoint
 from svgnet.evaluation import PointWiseEval, InstanceEval
 
+SKIP = {"wall", "row chairs", "curtain wall"}
 
 # ---------------------------- CVAT helpers ----------------------------
 def to_np(x):
@@ -40,38 +41,82 @@ def fmt_pts(p):
     return ";".join(f"{x:.2f},{y:.2f}" for x, y in p)
 
 
-def add_cvat_image(root, img_id, name, w, h, coords_px, instances,
+def _bin_mask(m):
+    m = np.asarray(m).reshape(-1)
+    if m.dtype == bool:
+        return m
+    # binary 0/1 or sigmoid probs -> 0.5; logits -> 0
+    return m > (0.5 if (m.min() >= 0 and m.max() <= 1) else 0)
+
+
+def resolve_instances(instances, N, score_thr, overlap_thr=0.5):
+    """Panoptic merge: highest score first, each primitive owned by at most one instance."""
+    items = []
+    for inst in instances:
+        score = float(to_np(inst["scores"]))
+        if score < score_thr:
+            continue
+        m = _bin_mask(to_np(inst["masks"]))[:N]           # drop padding points
+        if m.any():
+            items.append((score, int(to_np(inst["labels"])), m))
+    items.sort(key=lambda t: -t[0])
+    taken = np.zeros(N, dtype=bool)
+    out = []
+    for score, cls, m in items:
+        keep = m & ~taken
+        if keep.sum() < overlap_thr * m.sum():            # mostly duplicate of a better instance
+            continue
+        taken |= keep
+        out.append((score, cls, keep))
+    return out
+
+
+def add_cvat_image(root, img_id, name, w, h, coords_px, instances, sem,
                    num_classes, score_thr, mode):
-    """coords_px: (N,4,2) primitive sample points in image pixels.
-    instances: list of {"masks": (P,), "labels": int, "scores": float}, P >= N (padded)."""
+    """coords_px: (N,4,2) primitive points in image pixels.
+    sem: per-point semantic argmax (>= N, padded).
+    instances: list of {"masks", "labels", "scores"}."""
     img = ET.SubElement(root, "image", id=str(img_id), name=name,
                         width=str(w), height=str(h))
     N = coords_px.shape[0]
+    sem = np.asarray(sem).reshape(-1)[:N]
+    covered = np.zeros(N, dtype=bool)
     group = 0
-    for inst in instances:
-        score = float(to_np(inst["scores"]))
-        cls = int(to_np(inst["labels"]))
-        if score < score_thr or not (0 <= cls < num_classes):
-            continue
-        mask = (to_np(inst["masks"]).reshape(-1) > 0)[:N]   # drop padding points
-        if not mask.any():
-            continue
-        pts = coords_px[mask]                                # (M,4,2)
-        cat = SVG_CATEGORIES[cls]
-        common = dict(label=cat["name"], source="auto", occluded="0", z_order="0")
 
-        if mode == "box" and cat["isthing"]:
+    def emit(cls, pts, as_box):
+        nonlocal group
+        common = dict(label=SVG_CATEGORIES[cls]["name"], source="auto",
+                      occluded="0", z_order="0")
+        if as_box:
             x0, y0 = pts[..., 0].min(), pts[..., 1].min()
             x1, y1 = pts[..., 0].max(), pts[..., 1].max()
-            x1, y1 = max(x1, x0 + 1), max(y1, y0 + 1)        # avoid zero-area boxes
+            x1, y1 = max(x1, x0 + 1), max(y1, y0 + 1)
             ET.SubElement(img, "box", **common,
                           xtl=f"{x0:.2f}", ytl=f"{y0:.2f}",
                           xbr=f"{x1:.2f}", ybr=f"{y1:.2f}")
         else:
-            group += 1                                       # one group per instance
+            group += 1
             for p in pts:
                 ET.SubElement(img, "polyline", **common,
                               points=fmt_pts(p), group_id=str(group))
+
+    # instances, labelled by majority semantic vote (matches the verified overlay)
+    for score, cls, m in resolve_instances(instances, N, score_thr):
+        votes = sem[m]
+        votes = votes[votes < num_classes]
+        if votes.size:
+            cls = int(np.bincount(votes, minlength=num_classes).argmax())
+        if not (0 <= cls < num_classes) or SVG_CATEGORIES[cls]["name"] in SKIP:
+            continue
+        covered |= m
+        emit(cls, coords_px[m], mode == "box" and SVG_CATEGORIES[cls]["isthing"])
+
+    # stuff primitives not claimed by any instance (walls, railings, ...)
+    for cls in np.unique(sem[~covered]):
+        cls = int(cls)
+        if cls >= num_classes or SVG_CATEGORIES[cls]["isthing"] or SVG_CATEGORIES[cls]["name"] in SKIP:
+            continue
+        emit(cls, coords_px[~covered & (sem == cls)], False)
 
 
 def write_xml(root, path):
@@ -174,7 +219,7 @@ def main():
                 doc.close()
                 coords_px = coords_pt * np.array([sx, sy], dtype=np.float32)
                 add_cvat_image(cvat, i, img_name, w, h, coords_px, res["instances"],
-                               num_classes, args.score_thr, args.cvat_mode)
+                               sem_preds, num_classes, args.score_thr, args.cvat_mode)
 
             save_dicts.append({
                 "uuid": stem,
