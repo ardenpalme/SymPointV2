@@ -64,3 +64,14 @@ If you find our paper and code useful in your research, please consider giving a
   year={2024}
 }
 </code></pre>
+
+pip uninstall -y opencv-python
+pip install opencv-python-headless
+(spv2) ubuntu@thunder-client:~/SymPointV2$ PYTHONPATH=./ python tools/inference.py models/spv2-rep/svg_pointT.yaml models/spv2-rep/best.pth --datadir dataset/custom/ --split val --type PDF --cvat_xml dataset/custom/annotations.xml --cvat_img_dir dataset/custom/
+(spv2) ubuntu@thunder-client:~/SymPointV2/modules/pointops$ rm -rf build *.egg-info
+(spv2) ubuntu@thunder-client:~/SymPointV2/modules/pointops$ pip uninstall -y pointops
+WARNING: Skipping pointops as it is not installed.
+(spv2) ubuntu@thunder-client:~/SymPointV2/modules/pointops$ echo $TORCH_CUDA_ARCH_LIST
+(spv2) ubuntu@thunder-client:~/SymPointV2/modules/pointops$ sed -i 's/best_dist\[100\]/best_dist[256]/; s/best_idx\[100\]/best_idx[256]/' src/knnquery/knnquery_cuda_kernel.cu
+(spv2) ubuntu@thunder-client:~/SymPointV2/modules/pointops$ grep -n "best_dist\[2\|best_idx\[2" src/knnquery/knnquery_cuda_kernel.cu
+
