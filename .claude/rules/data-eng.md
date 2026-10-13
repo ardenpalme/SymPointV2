@@ -14,8 +14,8 @@ drawing area, then encodes the remaining primitives for the model.
 - **Leader**: straight, bent, or curved line from displaced text to its dimension line, sometimes with
   an arrowhead. Not every arrow is a leader; door and window direction arrows are architecture.
 - **Reference callout**: circle with a code (e.g. `A-4.03.51`) and a solid black lower part.
-- **Tag**: diamond with a code (e.g. `G03`) and a leader. The leader ends on a wall in a short line
-  stroked with a large width and round caps (not a filled shape).
+- **Tag**: diamond with a code (e.g. `G03`) and a leader. The leader ends on a wall in a short,
+  very wide stroke (the "end bar").
 - **ALIGN marker**: bracket with two solid arrowheads pointing at wall faces, plus the text `ALIGN`.
 - **Grid line**: long thin gray line across the drawing (the parser separates them by a gray style key).
 - Measurements, callouts, tags, ALIGN markers, grid lines, and all text are annotations: removed as
@@ -60,6 +60,7 @@ drawing area, then encodes the remaining primitives for the model.
 - How instances crossing window boundaries are merged.
 - A PDF without an annotation file: skip it, or write it with all primitives as background (35) and
   instance -1 (e.g. for inference-only drawings).
+- Filled shapes such as wall poché: encode their clip outlines as primitives, or encode strokes only.
 
 ## Data rules
 - `DATA_DIR` PDFs are read-only. Process every PDF in sorted order, every page. Deterministic output.
@@ -73,13 +74,51 @@ drawing area, then encodes the remaining primitives for the model.
 - Never hardcode a style key; derive it per drawing and log which key was chosen and why.
 - Vectorized Shapely 2 / STRtree queries; no Python loops over pairwise geometry.
 - Unknown drawing item kinds raise; never skip silently.
-- Closed annotation shapes mix item kinds: a callout "circle" is Bézier curves plus line segments, and
-  its black part is a filled path. Detect closed shapes after merging curves and lines together.
-- ALIGN arrowheads are bounded by axis-aligned `re` items in paths with `width` or `color` None, which
-  `parse()` currently skips. Keep those paths, and convert each arrowhead to a Shapely polygon with
-  `shapely.minimum_rotated_rectangle`.
-- The tag leader's end bar is a line item: find it by its large stroke width and round caps
-  (`lineCap` in `get_drawings()`), not by shape.
+- ALIGN arrowheads are clipped fills (see PDF encoding). Represent each arrowhead by its clip
+  polygon, closed, as a Shapely polygon. Don't use the fill's `re`: it is only the bounding box and
+  about twice the arrowhead's area.
+
+## PDF encoding (observed in A-1-03-10 only; other offices may differ)
+Facts:
+- Most paths are a single segment: polylines, leaders, and many arcs are split into one-segment
+  paths. Join pieces by shared endpoints (tolerance as a module constant) before detecting shapes.
+  Exceptions: 62 stroked paths made only of curves (e.g. the callout circle, one path of 4 curves),
+  6 paths mixing curves and lines, and 40 filled l polygons. 21 paths are both filled and stroked.
+- Style keys don't separate annotation from architecture: walls, dimension and extension lines,
+  leaders, and tag diamonds share black 0.36 or 0.24. Classify by geometry and relations (ticks,
+  text, leaders), never by style key alone.
+- `lineCap` is (1, 1, 1) on every stroke and None on fills. Don't use it.
+- Most fill paths (1,647 of 1,687) are a single axis-aligned `re` item with color and width None.
+  The other 40 fills are `l` polygons, including rotated text masks.
+- Clipped fills: in `get_drawings(extended=True)`, a `clip` entry at level 0 followed directly by one
+  level-1 entry means that entry is clipped. The clip's path is the visible shape (close it when
+  building the polygon); the `re` is only its bounding box, and the clip's `scissor` is the tighter
+  bbox. 1,158 of the 1,647 `re` fills are clipped this way, plus 5 strokes. No clip covers more than
+  one entry.
+- Example: each ALIGN arrowhead is a triangle clip (tip on the wall face) followed by a black `re`
+  fill of the clip's bounding box.
+- Text has a white mask fill underneath: an `re` for horizontal text, a 4-segment `l` polygon for
+  rotated text. A mask belongs to its text: remove them together, or it keeps hiding architecture.
+- Drawing order is only a weak hint: annotation strokes come late, fills (including ALIGN
+  arrowheads) come early.
+
+Signatures (widths are this file's values; derive them per drawing):
+- Measurement: ticks are short 45° strokes of width 0.48 (about 4.3 × 4.3 pt on a horizontal line,
+  6 pt axis-aligned on a 45° line). Dimension and extension lines are 0.36. A leader is a chain of
+  short 0.36 segments from a text corner to the dimension line.
+- Tag: the diamond is 4 diagonals of 12 × 12 pt over a white 24 × 24 pt `re`. The leader is one
+  0.36 line. The end bar is a 5.6–8.2 pt stroke of width 1.92, the widest stroke on the page.
+- ALIGN: the bracket is 3 lines of width 0.24. The arrowheads are black fill `re` items of
+  2.3 × 8.9 pt. There's no text mask.
+- Callout: the circle is one 0.36 path of 4 curves. Each black part is curve paths, a 7-segment line
+  chain, and a black fill `re` (its bounding box).
+- Grid lines: gray 0.498 at width 0.24, drawn as separate 6 pt and 24 pt pieces, not a dash pattern.
+
+Unverified (check before relying on them):
+- That all 91 strokes of width 1.92 are tag end bars.
+- That architecture never uses width 0.48 or 1.92.
+- That the 489 unclipped `re` fills (mostly white, some green, black, light blue) are real rectangles.
+- That the 1491 × 1491 pt black fill (clipped by a 163-segment polygon) is wall poché.
 
 ## Testing
 - Deterministic helpers (sampling, geometry utils, writers): `tdd`.
