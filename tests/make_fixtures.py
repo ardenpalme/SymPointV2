@@ -1,13 +1,14 @@
-"""Build the measurement, tag, ALIGN marker or callout fixtures: small crop PDFs of A-1-03-10 and
-candidate expected groups.
+"""Build the measurement, tag, ALIGN marker, callout or room label fixtures: small crop PDFs of
+A-1-03-10 and candidate expected groups.
 
 Usage, from the repo root:
-    python -m tests.make_fixtures --kind {measurements,tags,align,callouts} --review-dir DIR
+    python -m tests.make_fixtures --kind {measurements,tags,align,callouts,rooms} --review-dir DIR
 
 Writes tests/fixtures/<crop>.pdf, tests/expected/<crop>/<kind>.json, and DIR/<crop>.png
-with the candidate groups overlaid (one color per group, rect dashed, leader_rect dotted).
-The JSON files are candidates: they are produced by get_measurements(), get_tags(),
-get_align_markers() or get_callouts() itself and become expected outputs only after a human has reviewed the PNGs.
+with the candidate groups overlaid (one color per group, rect dashed, leader_rect dotted, room
+label end dots circled). The JSON files are candidates: they are produced by get_measurements(),
+get_tags(), get_align_markers(), get_callouts() or get_room_labels() itself and become expected
+outputs only after a human has reviewed the PNGs.
 Rerunning overwrites the crops of that kind only.
 
 A crop keeps only the drawing items whose rect (inflated by half the stroke width) meets its
@@ -24,9 +25,9 @@ from pathlib import Path
 import numpy as np
 import pymupdf
 import shapely
-from shapely import STRtree
+from shapely import Polygon, STRtree
 
-from data_eng.parser import JOIN_TOL, FloorPlanParser
+from data_eng.parser import JOIN_TOL, FloorPlanParser, room_label_json
 from data_eng.utils import remove_items
 
 SOURCE = Path("tmp_dataset/A-1-03-10 - LEVEL 03 - PARTITION PLAN.pdf")
@@ -81,6 +82,14 @@ CALLOUT_CROPS = {
         ("A-4.03.51", (1124.0, 863.0))
     ],  # parts far apart in drawing order, next to a tag and a measurement
 }
+# Crop stem -> room labels the crop must contain, each as (number, a point inside its rect on the page, pt).
+ROOM_CROPS = {
+    "room_bent_leader_03-C15": [("03-C15", (1430.0, 1000.0))],  # two-piece leader from the box bottom
+    "room_straight_leader_03-A36": [("03-A36", (1551.0, 1238.0))],  # one-piece leader
+    "room_no_leader_03-A20": [("03-A20", (963.0, 1400.0))],  # four name lines
+    "room_no_leader_03-A55": [("03-A55", (1732.0, 1443.0))],  # one name line
+    "room_leader_crosses_walls_03-C17": [("03-C17", (1532.0, 1097.0))],  # leader crosses 4 wall lines
+}
 COLORS = [
     (0.9, 0, 0),
     (0, 0.6, 0),
@@ -104,14 +113,19 @@ def select_measurements(groups: list[dict], texts: list[str]) -> list[dict]:
     return selected
 
 
+def rect_bounds(rect: list[float] | Polygon) -> pymupdf.Rect:
+    """A group's rect as a pymupdf.Rect: [x0, y0, x1, y1], or the bounds of a room label's Polygon."""
+    return pymupdf.Rect(rect.bounds if isinstance(rect, Polygon) else rect)
+
+
 def select_tags(
     groups: list[dict], picks: list[tuple[str, tuple[float, float]]]
 ) -> list[dict]:
-    """The one tag, ALIGN marker or callout per (text, point) whose rect contains the point."""
+    """The one tag, ALIGN marker, callout or room label per (text, point) whose rect contains the point."""
     selected = []
     for text, point in picks:
         matches = [
-            g for g in groups if g["text"] == text and pymupdf.Point(point) in pymupdf.Rect(g["rect"])
+            g for g in groups if g["text"] == text and pymupdf.Point(point) in rect_bounds(g["rect"])
         ]
         if len(matches) != 1:
             raise ValueError(f"{text!r} at {point} has {len(matches)} groups on the page, expected 1")
@@ -120,12 +134,14 @@ def select_tags(
 
 
 def crop_region(groups: list[dict]) -> pymupdf.Rect:
-    """Union of the groups' rects (and leader_rects), plus CROP_MARGIN (page space, pt)."""
+    """Union of the groups' rects (and leader_rects and dots), plus CROP_MARGIN (page space, pt)."""
     region = pymupdf.Rect()
     for group in groups:
-        region |= pymupdf.Rect(group["rect"])
+        region |= rect_bounds(group["rect"])
         if group.get("leader_rect") is not None:
             region |= pymupdf.Rect(group["leader_rect"])
+        if group.get("dot") is not None:
+            region |= pymupdf.Point(group["dot"].x, group["dot"].y)
     return region + (-CROP_MARGIN, -CROP_MARGIN, CROP_MARGIN, CROP_MARGIN)
 
 
@@ -202,7 +218,7 @@ def check_same_groups(selected: list[dict], crop_groups: list[dict], kept: list[
 
 
 def draw_review(pdf: Path, groups: list[dict], out: Path) -> None:
-    """Render pdf with each group's items, rect and leader_rect overlaid, labeled with its text."""
+    """Render pdf with each group's items, rect, leader_rect and dot overlaid, labeled with its text."""
     doc = pymupdf.open(pdf)
     page = doc[0]
     paths = page.get_drawings()
@@ -222,12 +238,18 @@ def draw_review(pdf: Path, groups: list[dict], out: Path) -> None:
                 else:
                     raise ValueError("unhandled drawing", item)
             shape.finish(color=color, width=0.8)
-        shape.draw_rect(pymupdf.Rect(group["rect"]))
+        if isinstance(group["rect"], Polygon):
+            shape.draw_polyline(list(group["rect"].exterior.coords))
+        else:
+            shape.draw_rect(pymupdf.Rect(group["rect"]))
         shape.finish(color=color, width=0.4, dashes="[2 1] 0")
         if group.get("leader_rect") is not None:
             shape.draw_rect(pymupdf.Rect(group["leader_rect"]))
             shape.finish(color=color, width=0.4, dashes="[0.4 0.8] 0")
-        x0, y0 = group["rect"][:2]
+        if group.get("dot") is not None:
+            shape.draw_circle((group["dot"].x, group["dot"].y), 4.0)
+            shape.finish(color=color, width=0.4)
+        x0, y0 = rect_bounds(group["rect"]).tl
         shape.insert_text(
             (x0 + 1, y0 + 5), f"{n}: {group['text']}", fontsize=5, color=color
         )
@@ -239,7 +261,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--kind", choices=["measurements", "tags", "align", "callouts"], required=True)
+    parser.add_argument("--kind", choices=["measurements", "tags", "align", "callouts", "rooms"], required=True)
     parser.add_argument("--review-dir", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -254,14 +276,23 @@ def main(argv: list[str] | None = None) -> None:
         if args.kind == "align":
             fp.get_align_markers()
             return fp.align_markers, fp.unclassified_align_markers
-        fp.get_callouts()
-        return fp.callouts, fp.unclassified_callouts
+        if args.kind == "callouts":
+            fp.get_callouts()
+            return fp.callouts, fp.unclassified_callouts
+        fp.get_room_labels()
+        return fp.enc_labels, fp.unclassified_room_labels
 
     source = pymupdf.open(SOURCE)
     full_groups, _ = groups_of(FloorPlanParser(source[0]))
     FIXTURES.mkdir(parents=True, exist_ok=True)
     args.review_dir.mkdir(parents=True, exist_ok=True)
-    crops = {"measurements": CROPS, "tags": TAG_CROPS, "align": ALIGN_CROPS, "callouts": CALLOUT_CROPS}[args.kind]
+    crops = {
+        "measurements": CROPS,
+        "tags": TAG_CROPS,
+        "align": ALIGN_CROPS,
+        "callouts": CALLOUT_CROPS,
+        "rooms": ROOM_CROPS,
+    }[args.kind]
     for stem, picks in crops.items():
         if args.kind == "measurements":
             selected = select_measurements(full_groups, picks)
@@ -277,7 +308,10 @@ def main(argv: list[str] | None = None) -> None:
         check_same_groups(selected, groups, kept)
         out = EXPECTED / stem
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"{args.kind}.json").write_text(json.dumps(groups, indent=1) + "\n")
+        if args.kind == "rooms":
+            (out / "room_labels.json").write_text(json.dumps([room_label_json(g) for g in groups], indent=1) + "\n")
+        else:
+            (out / f"{args.kind}.json").write_text(json.dumps(groups, indent=1) + "\n")
         draw_review(pdf, groups, args.review_dir / f"{stem}.png")
         print(
             f"{stem}: region {tuple(round(v, 2) for v in region)}, {len(crop.paths)} drawing items, "

@@ -41,6 +41,7 @@ def main() -> None:
             parser.get_tags()
             parser.get_align_markers()
             parser.get_callouts()
+            parser.get_room_labels()
             parser.draw(out_dir)
 
 

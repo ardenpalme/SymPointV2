@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import math
 import re
 from collections import defaultdict
@@ -11,10 +10,10 @@ import pymupdf
 import shapely
 import yaml
 from shapely import LineString, MultiLineString, MultiPolygon, Polygon, STRtree
-from shapely.ops import linemerge, polygonize
+from shapely.ops import polygonize
 from tqdm import tqdm
 
-from .geom import bezier_points, find_enclosed_circles, find_rectangles
+from .geom import bezier_points, find_rectangles
 from .utils import display_geoms, remove_items
 
 THRSH = 3.0
@@ -55,6 +54,16 @@ CALLOUT_ROUND_TOL = 0.2  # pt; closed curve-only paths deviate 0.013-0.055 from 
 CALLOUT_TOUCH_TOL = 0.5  # pt; black part clips touch the circle (0.0), outlines follow them (chords about 0.11 off the arc)
 CALLOUT_NUMBER_RE = re.compile(r"\d+")  # whole text of a view number next to a black part, e.g. "5"
 CALLOUT_NUMBER_MAX_GAP = 4.0  # pt; black part to view number bbox, 0.0-3.05; the next text is 4.61 away
+
+# Room label grouping. Ranges in comments were measured in A-1-03-10.
+ROOM_NUMBER_RE = re.compile(r"\d\d-[A-Z]\d\d[A-Z]?")  # whole text of a room number, e.g. "03-C15"
+ROOM_BOX_MAX_AREA_RATIO = 1.75  # box area / number text bbox area; boxes are 1.42-1.46
+ROOM_EDGE_TOL = 0.05  # pt; box corners come from edge ends rounded to 0.01 pt
+ROOM_MASK_TOL = 0.5  # pt; max difference between the number's mask bounds and its box (0.0)
+ROOM_NAME_MAX_GAP = 3.0  # pt; box to first name line 1.96-2.21, between name lines 1.65-1.78
+ROOM_NAME_CENTER_TOL = 1.0  # pt; name line center to box center, -0.20-0.11
+ROOM_DOT_MAX_RADIUS = 4.0  # pt; end dots are 2.82-2.88
+ROOM_LEADER_MAX_TURN = 90.0  # degrees; room leaders bend by 45-60
 
 
 def style_key(path: dict) -> tuple | None:
@@ -139,6 +148,21 @@ def union_rect(rects: list) -> list[float]:
     return [round(float(v), 3) for v in out]
 
 
+def room_label_json(group: dict) -> dict:
+    """A room label group with its rect as 4 [x, y] corners and its dot as [x, y] (pt, rounded to
+    3 decimals), for JSON."""
+    corners = shapely.get_coordinates(group["rect"].exterior)[:-1]
+    dot = group["dot"]
+    return {
+        "text": group["text"],
+        "name": group["name"],
+        "rect": [[round(float(x), 3), round(float(y), 3)] for x, y in corners],
+        "leader_rect": group["leader_rect"],
+        "dot": None if dot is None else [round(dot.x, 3), round(dot.y, 3)],
+        "items": group["items"],
+    }
+
+
 def words_from_blocks(blocks: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per text line of get_text("dict") blocks: bbox polygon, text, and angle in whole degrees.
 
@@ -173,7 +197,7 @@ class FloorPlanParser:
         self.word_bboxes, self.word_texts, self.word_angles = words_from_blocks(self.blocks)
 
     def parse(self):
-        lines, curves, rects = defaultdict(list), defaultdict(list), defaultdict(list)
+        lines = defaultdict(list)
         for path in tqdm(self.paths):
             key = style_key(path)
             if key is None:
@@ -181,26 +205,10 @@ class FloorPlanParser:
 
             for item in path["items"]:
                 kind = item[0]
-                if kind in ["re", "qu"]:
-                    q = item[1].quad if item[0] == "re" else item[1]
-                    rect = Polygon([q.ul, q.ur, q.lr, q.ll, q.ul])
-                    rects[key].append(rect)
-                    
-                elif kind == "l":
-                    line = LineString([item[1], item[-1]])
-                    lines[key].append(line)
-                    
-                elif kind == "c":
-                    nodes = np.array(item[1:])
-                    if np.ptp(nodes, axis=0).max() == 0: continue
-                    curve = shapely.LineString(bezier_points(nodes))
-                    curves[key].append(curve)
-                    
-                else:
+                if kind == "l":
+                    lines[key].append(LineString([item[1], item[-1]]))
+                elif kind not in ("re", "qu", "c"):
                     raise ValueError("unhandled drawing", item)
-
-        geoms_dict = copy.deepcopy(lines)
-        geoms_dict.update(curves)
 
         # TODO@CLaude: These are only valid regions for one of the files, 
         # To build a robust pipeline, you will need to pre-process files where the drawing area and the 
@@ -208,41 +216,6 @@ class FloorPlanParser:
         self.drawing_area = polygonize(lines[((0.0, 0.0, 0.0), 1.68)])[0] 
         self.grid_key = ((0.498, 0.498, 0.498), 0.24)
         self.grid_lines = lines[self.grid_key]
-        lines.pop(((0.0, 0.0, 0.0), 1.68))
-        lines.pop(self.grid_key)
-
-        rl = []
-        for val in lines.values():
-            rl.extend(val)
-        merged_lines = linemerge(rl)
-        raw_lines = np.array(list(merged_lines.geoms))
-
-        cs = []
-        for val in curves.values():
-            cs.extend(val)
-        merged_curves = linemerge(cs)
-        curves_list = list(merged_curves.geoms)
-
-        self.circles = []
-        for curve in curves_list:
-            if(curve.is_ring):
-                self.circles.append(Polygon(curve.coords))
-
-        self.rects, rem_ls = find_rectangles(raw_lines)
-        self.enc_cir, ls = find_enclosed_circles(rem_ls)
-
-        self.conv_sh = np.array(self.enc_cir + self.circles + self.rects)
-        self.conv_tree = STRtree(self.conv_sh)
-
-        self.lines = ls
-        self.lines_tree = STRtree(self.lines)
-
-        word_idx, sh_idx = self.conv_tree.query(self.word_bboxes, predicate="intersects")
-        overlap = shapely.area(shapely.intersection(self.conv_sh[sh_idx], self.word_bboxes[word_idx]))
-        word_share = overlap / shapely.area(self.word_bboxes[word_idx])
-        shape_share = overlap / shapely.area(self.conv_sh[sh_idx])
-        keep = (word_share > 0.40) & (shape_share > 0.1)
-        self.enc_labels = self.conv_sh[sh_idx[keep]]
 
     def _index_segments(self) -> None:
         """One straight segment per l item (and per c item, as its chord) of every stroked path.
@@ -1016,10 +989,216 @@ class FloorPlanParser:
             f"a circle not in a callout"
         )
 
+    def _room_leader(
+        self, region: Polygon | MultiPolygon, edges: np.ndarray, dot_center: np.ndarray, dot_radius: np.ndarray
+    ) -> tuple[list[int], int] | str | None:
+        """Leader from a room label's box or name lines (region) to an end dot: (leader segments,
+        dot), None if no chain reaches a dot, or a failure reason.
+
+        Starts from every segment other than the box edges with an end within THRSH of region and
+        follows pieces joined end to end (_next_piece, ROOM_LEADER_MAX_TURN) until the free end lies
+        within a dot's radius plus JOIN_TOL. Chains ending anywhere else (walls, other annotations)
+        are ignored. All chains that reach a dot must reach the same one and be parts of the longest.
+        """
+        found = []
+        for s in self.seg_tree.query(region, predicate="dwithin", distance=THRSH):
+            if s in edges:
+                continue
+            ends = self.seg_xy[s]
+            dist = shapely.distance(shapely.points(ends), region)
+            if dist.min() > THRSH:
+                continue
+            far = int(np.argmax(dist))
+            prev, free = ends[1 - far], ends[far]
+            chain = [int(s)]
+            for _ in range(LEADER_MAX_SEGS):
+                hit = np.flatnonzero(np.linalg.norm(dot_center - free, axis=1) <= dot_radius + JOIN_TOL)
+                if len(hit) > 1:
+                    return f"leader ends on {len(hit)} dots"
+                if len(hit) == 1:
+                    found.append((chain, int(hit[0])))
+                    break
+                heading = math.degrees(math.atan2(free[1] - prev[1], free[0] - prev[0]))
+                near = self.seg_tree.query(shapely.points(free), predicate="dwithin", distance=JOIN_TOL)
+                near = near[~np.isin(near, np.concatenate([chain, edges]))]
+                j = self._next_piece(free, heading, near, ROOM_LEADER_MAX_TURN)
+                if j is None:
+                    break
+                chain.append(j)
+                ends = self.seg_xy[j]
+                far = int(np.argmax(np.linalg.norm(ends - free, axis=1)))
+                prev, free = free, ends[far]
+        if not found:
+            return None
+        chain, dot = max(found, key=lambda f: len(f[0]))
+        if any(fd != dot or not set(fc) <= set(chain) for fc, fd in found):
+            return f"{len(found)} possible leaders"
+        return chain, dot
+
+    def get_room_labels(self) -> None:
+        """Group each room label: number, name lines, number box, text masks, leader and end dot.
+
+        A room number is a horizontal text line matching ROOM_NUMBER_RE inside a box: a rectangle
+        of straight stroked segments (find_rectangles on the segments within THRSH of the text)
+        that contains the text center and is at most ROOM_BOX_MAX_AREA_RATIO times the text bbox
+        area. Matching text without a box is not a room label. The box edges are all segments
+        within ROOM_EDGE_TOL of its outline (each edge is drawn twice). Name lines are stacked
+        above the box: each next line is horizontal, its bottom within ROOM_NAME_MAX_GAP above the
+        current top and its center within ROOM_NAME_CENTER_TOL of the box center. The number's
+        mask is a fill matching the box within ROOM_MASK_TOL; name masks are found as in
+        get_measurements; at most one per text. End dots are filled circles (circle_of) of radius
+        at most ROOM_DOT_MAX_RADIUS. The leader (_room_leader) is optional; a dot reached from
+        more than one label leaves all of them unclassified.
+
+        Sets self.enc_labels, a list of {text, name, rect, leader_rect, dot, items}: rect is the
+        minimum rotated rectangle of the box and name lines (Polygon), leader_rect the bounding
+        [x0, y0, x1, y1] of the leader or None, dot the end dot's center (Point) or None, and
+        items sorted indices into self.paths (page space, pt). Sets self.unclassified_room_labels,
+        a list of {text, bbox (the box's, else the text's), reason}. Uses only self.paths and
+        the text, so it does not need parse().
+        """
+        self._index_segments()
+        self._index_masks()
+        word_bounds = shapely.bounds(self.word_bboxes)
+        word_cx = (word_bounds[:, 0] + word_bounds[:, 2]) / 2
+        dot_path, dot_center, dot_radius = [], [], []
+        for i, path in enumerate(self.paths):
+            found = circle_of(path) if "f" in path["type"] else None
+            if found is not None and found[1] <= ROOM_DOT_MAX_RADIUS:
+                dot_path.append(i)
+                dot_center.append(found[0])
+                dot_radius.append(found[1])
+        dot_center = np.array(dot_center, dtype=float).reshape(-1, 2)
+        dot_radius = np.array(dot_radius, dtype=float)
+
+        self.enc_labels, self.unclassified_room_labels = [], []
+        numbers = np.flatnonzero([ROOM_NUMBER_RE.fullmatch(t) is not None for t in self.word_texts])
+        cands = []  # labels whose parts were all found, before dot ownership and path checks
+        n_no_box = 0
+        for k in numbers:
+            text, bbox = str(self.word_texts[k]), self.word_bboxes[k]
+            unclassified = {"text": text, "bbox": [round(float(v), 3) for v in bbox.bounds]}
+            near = self.seg_tree.query(bbox, predicate="dwithin", distance=THRSH)
+            rects, _ = find_rectangles(self.seg_geoms[near[self.seg_kind[near] == "l"]])
+            center = shapely.centroid(bbox)
+            boxes = [r for r in rects if r.contains(center) and r.area <= ROOM_BOX_MAX_AREA_RATIO * bbox.area]
+            if not boxes:
+                n_no_box += 1
+                continue
+            if len(boxes) > 1:
+                self.unclassified_room_labels.append({**unclassified, "reason": f"{len(boxes)} boxes"})
+                continue
+            box = boxes[0]
+            unclassified["bbox"] = [round(float(v), 3) for v in box.bounds]
+            if self.word_angles[k] != 0:
+                self.unclassified_room_labels.append({**unclassified, "reason": "number not horizontal"})
+                continue
+            edges = self.seg_tree.query(box.exterior.buffer(ROOM_EDGE_TOL), predicate="contains")
+
+            x0, top, x1, _ = box.bounds
+            name: list[int] = []
+            reason = None
+            while True:
+                gap = top - word_bounds[:, 3]
+                above = np.flatnonzero(
+                    (self.word_angles == 0)
+                    & (gap >= 0)
+                    & (gap <= ROOM_NAME_MAX_GAP)
+                    & (np.abs(word_cx - (x0 + x1) / 2) <= ROOM_NAME_CENTER_TOL)
+                )
+                if len(above) != 1:
+                    if len(above) > 1:
+                        reason = f"{len(above)} candidate name lines"
+                    break
+                name.insert(0, int(above[0]))
+                top = word_bounds[above[0], 1]
+            if reason is None and not name:
+                reason = "no name above the box"
+
+            masks: list[int] = []
+            if reason is None:
+                cand = self.mask_tree.query(box, predicate="intersects")
+                off = np.abs(shapely.bounds(self.mask_polys[cand]) - np.array(box.bounds)).reshape(-1, 4)
+                masks = self.mask_path[cand[off.max(axis=1, initial=0.0) <= ROOM_MASK_TOL]].tolist()
+                if len(masks) > 1:
+                    reason = f"{len(masks)} candidate masks {masks} for {text!r}"
+            for t in name if reason is None else []:
+                tb = self.word_bboxes[t]
+                cand = self.mask_tree.query(tb, predicate="intersects")
+                cover = shapely.area(shapely.intersection(self.mask_polys[cand], tb)) / tb.area
+                ratio = shapely.area(self.mask_polys[cand]) / tb.area
+                found = self.mask_path[cand[(cover >= MASK_MIN_COVER) & (ratio <= MASK_MAX_AREA_RATIO)]]
+                if len(found) > 1:
+                    reason = f"{len(found)} candidate masks {found.tolist()} for {self.word_texts[t]!r}"
+                    break
+                masks += found.tolist()
+
+            leader = None
+            if reason is None:
+                region = shapely.union_all([box, *self.word_bboxes[name]])
+                leader = self._room_leader(region, edges, dot_center, dot_radius)
+                if isinstance(leader, str):
+                    reason = leader
+            if reason is not None:
+                self.unclassified_room_labels.append({**unclassified, "reason": reason})
+                continue
+            cands.append((text, unclassified, box, edges, name, masks, leader))
+
+        reached = defaultdict(int)  # dot -> labels whose leader reaches it
+        for *_, leader in cands:
+            if leader is not None:
+                reached[leader[1]] += 1
+        claimed: dict[int, str] = {}  # path index -> bbox of the label box that owns it
+        used_dots: set[int] = set()
+        for text, unclassified, box, edges, name, masks, leader in cands:
+            chain, dot = leader if leader is not None else ([], None)
+            if dot is not None and reached[dot] > 1:
+                reason = f"dot reached from {reached[dot]} labels"
+                self.unclassified_room_labels.append({**unclassified, "reason": reason})
+                continue
+            paths, partial = self._group_paths(np.concatenate([edges, chain]).astype(int))
+            if partial:
+                reason = f"paths {partial} have items outside the group"
+                self.unclassified_room_labels.append({**unclassified, "reason": reason})
+                continue
+            dot_items = [dot_path[dot]] if dot is not None else []
+            items = sorted(set(paths + masks + dot_items))
+            taken = sorted({claimed[p] for p in items if p in claimed})
+            if taken:
+                reason = f"paths already used by labels at {taken}"
+                self.unclassified_room_labels.append({**unclassified, "reason": reason})
+                continue
+            claimed.update({p: str(unclassified["bbox"]) for p in items})
+            leader_paths = sorted({int(self.seg_path[s]) for s in chain})
+            if dot is not None:
+                used_dots.add(dot)
+            self.enc_labels.append(
+                {
+                    "text": text,
+                    "name": " ".join(str(self.word_texts[t]) for t in name),
+                    "rect": shapely.minimum_rotated_rectangle(shapely.union_all([box, *self.word_bboxes[name]])),
+                    "leader_rect": union_rect([self.paths[p]["rect"] for p in leader_paths]) if chain else None,
+                    "dot": shapely.Point(dot_center[dot]) if dot is not None else None,
+                    "items": items,
+                }
+            )
+        n_leader = sum(g["dot"] is not None for g in self.enc_labels)
+        print(
+            f"room labels: {len(numbers)} {ROOM_NUMBER_RE.pattern!r} texts, {n_no_box} without a box, "
+            f"{len(self.enc_labels)} grouped ({n_leader} with a leader), "
+            f"{len(self.unclassified_room_labels)} unclassified; "
+            f"{len(dot_path) - len(used_dots)} of {len(dot_path)} end dots not in a label"
+        )
+
     def draw(self, out_dir: Path) -> None:
         debug_dir = out_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
-        display_geoms(self.page, self.enc_labels, debug_dir / "labels.pdf")
+        if not hasattr(self, "enc_labels"):
+            raise RuntimeError("call get_room_labels() before draw()")
+        label_geoms = [g["rect"] for g in self.enc_labels]
+        label_geoms += [shapely.box(*g["leader_rect"]) for g in self.enc_labels if g["leader_rect"] is not None]
+        label_geoms += [g["dot"] for g in self.enc_labels if g["dot"] is not None]
+        display_geoms(self.page, label_geoms, debug_dir / "labels.pdf")
         display_geoms(self.page, self.grid_lines, debug_dir / "grid_lines.pdf")
 
         # Copy the page so self.page stays untouched; insert_pdf keeps mediabox and rotation.
@@ -1038,25 +1217,30 @@ class FloorPlanParser:
         tags = {i for group in self.tags for i in group["items"]}
         align = {i for group in self.align_markers for i in group["items"]}
         callouts = {i for group in self.callouts for i in group["items"]}
-        drop = [g or i in meas or i in tags or i in align or i in callouts for i, g in enumerate(grid)]
+        rooms = {i for group in self.enc_labels for i in group["items"]}
+        drop = [
+            g or i in meas or i in tags or i in align or i in callouts or i in rooms for i, g in enumerate(grid)
+        ]
         remove_items(out[0], self.paths, drop, drop_text=True)
         out[0].set_cropbox(pymupdf.Rect(self.drawing_area.bounds))
         out.save(out_dir / "drawing.pdf", garbage=3, deflate=True)
         print(f"{out_dir}: removed all text, {sum(grid)} grid line paths, {len(self.measurements)} "
               f"measurement groups ({len(meas)} paths), {len(self.tags)} tags ({len(tags)} paths), "
               f"{len(self.align_markers)} ALIGN markers ({len(align)} paths), "
-              f"and {len(self.callouts)} callouts ({len(callouts)} paths), "
+              f"{len(self.callouts)} callouts ({len(callouts)} paths), "
+              f"and {len(self.enc_labels)} room labels ({len(rooms)} paths), "
               f"cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
         self.write_unclassified(out_dir / "unclassified.yaml")
         # TODO@Claude Remove the remaining annotations as whole groups: title block, legend, enclosing
-        # labels. (All text, grid lines, measurements, tags, ALIGN markers and callouts are done.)
+        # labels. (All text, grid lines, measurements, tags, ALIGN markers, callouts and room labels
+        # are done.)
         # Delete specific drawing items; never redact a bbox. Unclassifiable items stay (unclassified.yaml).
         # Save the remaining primitive geoms in self.prim (label geometry stays in self.enc_labels).
 
 
     def write_unclassified(self, path: Path) -> None:
-        """Write the measurement texts, tags, ALIGN markers and callouts that could not be grouped
-        (left in the drawing) as YAML."""
+        """Write the measurement texts, tags, ALIGN markers, callouts and room labels that could not
+        be grouped (left in the drawing) as YAML."""
         items = [
             {"kind": "measurement_text", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_measurements
@@ -1069,6 +1253,9 @@ class FloorPlanParser:
         ] + [
             {"kind": "callout", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_callouts
+        ] + [
+            {"kind": "room_label", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
+            for u in self.unclassified_room_labels
         ]
         doc = {
             "source": self.page.parent.name,

@@ -37,8 +37,8 @@ drawing area, then encodes the remaining primitives for the model.
 - `measurements.yaml` (endpoints, text as written, length in pt), `rooms.yaml` (text, position, bbox).
 - `<input-stem>_s2.npz`: primitives from `self.prim`, in the `parse_svg_v5.py` format (see Contracts in
   CLAUDE.md). `semanticIds` and `instanceIds` come from the boxes in `annotations/<pdf stem>.xml`.
-- Room label groups (`rect`, `leader_rect`, `dot`, `items`) and oval tag groups (`rect`, `leader_rect`,
-  `items`) are stored in `self.enc_labels`; they never go into `self.prim`.
+- Room label groups (`text`, `name`, `rect`, `leader_rect`, `dot`, `items`) and oval tag groups (`rect`,
+  `leader_rect`, `items`) are stored in `self.enc_labels`; they never go into `self.prim`.
 - YAML starts with `source`, `page`, `coordinate_space`, `units`. Debug renders go in `debug/`.
   No new files or fields without asking.
 
@@ -107,6 +107,7 @@ Facts:
   fill of the clip's bounding box.
 - Text has a white mask fill underneath: an `re` for horizontal text, a 4-segment `l` polygon for
   rotated text. A mask belongs to its text: remove them together, or it keeps hiding architecture.
+  Exception: room names have no mask; the room number's box `re` is its mask.
 - Drawing order is only a weak hint: annotation strokes come late, fills (including ALIGN
   arrowheads) come early.
 - The oval of an oval tag is a convex polygon of many short line segments, some overlapping,
@@ -124,6 +125,12 @@ Signatures (widths are this file's values; derive them per drawing):
 - Callout: the circle is one 0.36 path of 4 curves. Each black part is curve paths, a 7-segment line
   chain, and a black fill `re` (its bounding box).
 - Grid lines: gray 0.498 at width 0.24, drawn as separate 6 pt and 24 pt pieces, not a dash pattern.
+- Room label: one contiguous run in drawing order: dot, leader, 4 box edges, white `re`, the same
+  4 edges again, then one text object with the name lines and the number (ArialNarrow,Bold 8.05 pt).
+  All black 0.36, level 0, unclipped. Box 25.4–25.6 × 9.8–10.0 pt. Leader: 1–2 one-segment lines,
+  23.5–75.4 pt, from the box edge (7) or the name bbox (3; one ends 2.2 pt below it) to the dot
+  center. Dot: one `fs` path of 4 curves, black fill and stroke, 5.6–5.8 pt. 72 labels (69 distinct
+  numbers), 10 with a leader, 10 dots on the page.
 
 Unverified (check before relying on them):
 - That all 91 strokes of width 1.92 are tag end bars.
@@ -131,6 +138,8 @@ Unverified (check before relying on them):
 - That the 489 unclipped `re` fills (mostly white, some green, black, light blue) are real rectangles.
 - That the 1491 × 1491 pt black fill (clipped by a 163-segment polygon) is wall poché.
 - That oval tag arrowheads are clipped fills like ALIGN arrowheads.
+- That the 29 regular-weight, mostly 45°-rotated `NN-XNN` texts are door numbers (not room labels).
+- That room label leaders start only on the box or the name bbox.
 
 ## Testing
 - Deterministic helpers (sampling, geometry utils, writers): `tdd`.
