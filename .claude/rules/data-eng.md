@@ -17,9 +17,16 @@ drawing area, then encodes the remaining primitives for the model.
 - **Tag**: diamond with a code (e.g. `G03`) and a leader. The leader ends on a wall in a short,
   very wide stroke (the "end bar").
 - **ALIGN marker**: bracket with two solid arrowheads pointing at wall faces, plus the text `ALIGN`.
+- **Room label**: room name in bold capitals (one or more lines, e.g. `PRINT / COPY`) above a
+  rectangle containing the room number (e.g. `03-A36`). Sometimes a leader, straight or bent,
+  runs from the rectangle to a solid black dot inside the room. Leaders often cross walls.
+  Examples: `.claude/agents/assets/room_label_*.png`.
+- **Oval tag**: a number (e.g. `110`) inside an oval outline, with a leader (often bent once)
+  ending in a solid black arrowhead that touches a wall or window.
+  Examples: `.claude/agents/assets/oval_tag_*.png`.
 - **Grid line**: long thin gray line across the drawing (the parser separates them by a gray style key).
-- Measurements, callouts, tags, ALIGN markers, grid lines, and all text are annotations: removed as
-  whole groups. Examples: `.claude/agents/assets/`.
+- Measurements, callouts, tags, ALIGN markers, room labels, oval tags, grid lines, and all text are
+  annotations: removed as whole groups. Examples: `.claude/agents/assets/`.
 - **Primitive**: one architectural line, arc, or circle left after all annotations are removed.
 - **Style key**: `(color, width)` of a path; acts like a CAD layer. Differs per file.
 
@@ -30,7 +37,8 @@ drawing area, then encodes the remaining primitives for the model.
 - `measurements.yaml` (endpoints, text as written, length in pt), `rooms.yaml` (text, position, bbox).
 - `<input-stem>_s2.npz`: primitives from `self.prim`, in the `parse_svg_v5.py` format (see Contracts in
   CLAUDE.md). `semanticIds` and `instanceIds` come from the boxes in `annotations/<pdf stem>.xml`.
-- Label geometry (shapes enclosing room labels) stays in `self.enc_labels`; it never goes into `self.prim`.
+- Room label groups (`rect`, `leader_rect`, `dot`, `items`) and oval tag groups (`rect`, `leader_rect`,
+  `items`) are stored in `self.enc_labels`; they never go into `self.prim`.
 - YAML starts with `source`, `page`, `coordinate_space`, `units`. Debug renders go in `debug/`.
   No new files or fields without asking.
 
@@ -101,6 +109,9 @@ Facts:
   rotated text. A mask belongs to its text: remove them together, or it keeps hiding architecture.
 - Drawing order is only a weak hint: annotation strokes come late, fills (including ALIGN
   arrowheads) come early.
+- The oval of an oval tag is a convex polygon of many short line segments, some overlapping,
+  not curves. Overlapping segments break linemerge and polygonize, so detect the oval as the
+  cluster of segments around the number, or by its convex hull.
 
 Signatures (widths are this file's values; derive them per drawing):
 - Measurement: ticks are short 45° strokes of width 0.48 (about 4.3 × 4.3 pt on a horizontal line,
@@ -119,6 +130,7 @@ Unverified (check before relying on them):
 - That architecture never uses width 0.48 or 1.92.
 - That the 489 unclipped `re` fills (mostly white, some green, black, light blue) are real rectangles.
 - That the 1491 × 1491 pt black fill (clipped by a 163-segment polygon) is wall poché.
+- That oval tag arrowheads are clipped fills like ALIGN arrowheads.
 
 ## Testing
 - Deterministic helpers (sampling, geometry utils, writers): `tdd`.
