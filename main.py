@@ -40,6 +40,7 @@ def main() -> None:
             parser.get_measurements()
             parser.get_tags()
             parser.get_align_markers()
+            parser.get_callouts()
             parser.draw(out_dir)
 
 

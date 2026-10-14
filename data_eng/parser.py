@@ -10,7 +10,7 @@ import numpy as np
 import pymupdf
 import shapely
 import yaml
-from shapely import LineString, MultiPolygon, Polygon, STRtree
+from shapely import LineString, MultiLineString, MultiPolygon, Polygon, STRtree
 from shapely.ops import linemerge, polygonize
 from tqdm import tqdm
 
@@ -49,6 +49,12 @@ ALIGN_TEXT_MAX_GAP = 4.0  # pt; crossbar to text bbox, 0.95-2.41
 ALIGN_LEG_MAX_LEN = 20.0  # pt; legs are 1.7-14 pt long
 ALIGN_HEAD_MAX_LEN = 12.0  # pt; long side of an arrowhead's min rotated rectangle, 8.7-9.1
 ALIGN_HEAD_MIN_ASPECT = 2.5  # arrowhead long side / short side; 2.2-2.3 pt wide, so about 3.9
+
+# Callout grouping. Ranges in comments were measured in A-1-03-10.
+CALLOUT_ROUND_TOL = 0.2  # pt; closed curve-only paths deviate 0.013-0.055 from their radius
+CALLOUT_TOUCH_TOL = 0.5  # pt; black part clips touch the circle (0.0), outlines follow them (chords about 0.11 off the arc)
+CALLOUT_NUMBER_RE = re.compile(r"\d+")  # whole text of a view number next to a black part, e.g. "5"
+CALLOUT_NUMBER_MAX_GAP = 4.0  # pt; black part to view number bbox, 0.0-3.05; the next text is 4.61 away
 
 
 def style_key(path: dict) -> tuple | None:
@@ -90,6 +96,40 @@ def clip_polygon(items: list) -> Polygon | MultiPolygon:
     total = sum(g.area for g in parts)
     kept = [g for g in parts if g.area > SLIVER_MAX_AREA_FRAC * total]
     return shapely.union_all(kept)
+
+
+def path_line(path: dict) -> LineString | MultiLineString:
+    """Centerline of a get_drawings() path of l and c items (page space, pt); c items are sampled
+    with bezier_points. Raises ValueError for other items."""
+    parts = []
+    for item in path["items"]:
+        if item[0] == "l":
+            parts.append(LineString([tuple(item[1]), tuple(item[2])]))
+        elif item[0] == "c":
+            parts.append(LineString(bezier_points(np.array([tuple(p) for p in item[1:]]))))
+        else:
+            raise ValueError("unhandled drawing", item)
+    return MultiLineString(parts) if len(parts) > 1 else parts[0]
+
+
+def circle_of(path: dict) -> tuple[np.ndarray, float] | None:
+    """(center, radius) of a get_drawings() path drawn as a circle (page space, pt), else None.
+
+    A circle is made only of c items, ends within JOIN_TOL of where it starts, and every sampled
+    point lies within CALLOUT_ROUND_TOL of the radius from the center of their bounding box.
+    """
+    items = path["items"]
+    if not items or any(item[0] != "c" for item in items):
+        return None
+    if math.dist(items[0][1], items[-1][4]) > JOIN_TOL:
+        return None
+    pts = np.concatenate([bezier_points(np.array([tuple(p) for p in item[1:]])) for item in items])
+    center = (pts.min(axis=0) + pts.max(axis=0)) / 2
+    dist = np.linalg.norm(pts - center, axis=1)
+    radius = float(dist.mean())
+    if np.abs(dist - radius).max() > CALLOUT_ROUND_TOL:
+        return None
+    return center, radius
 
 
 def union_rect(rects: list) -> list[float]:
@@ -669,27 +709,37 @@ class FloorPlanParser:
             f"{len(wide_paths - set(claimed))} of {len(wide_paths)} paths not in a tag"
         )
 
-    def _index_arrowheads(self) -> None:
-        """Clipped fills small enough to be arrowheads, represented by their clip area.
+    def _clipped_fills(self) -> list[tuple[dict, int]]:
+        """(clip, index into self.paths) of every fill-only path clipped on its own.
 
         In get_drawings(extended=True) a level-0 clip followed directly by one level-1 fill-only
-        path clips that path. Candidates are clips of only l items whose scissor fits in
-        ALIGN_HEAD_MAX_LEN and whose area is one polygon (clip_polygon). Sets head_polys,
-        head_path (index into self.paths of the fill), head_color (fill color), head_len and
-        head_width (long and short side of the min rotated rectangle, pt), and head_tree.
+        path clips that path; clips of a stroke or of more than one entry are left out.
         """
         ext = self.page.get_drawings(extended=True)
         painted = [p["seqno"] for p in ext if p["type"] != "clip"]
         if painted != [p["seqno"] for p in self.paths]:
             raise RuntimeError("extended drawings do not match get_drawings() by seqno")
         seq_to_path = {p["seqno"]: i for i, p in enumerate(self.paths)}
-        polys, head_path, head_color = [], [], []
+        found = []
         for k, clip in enumerate(ext[:-1]):
             if clip["type"] != "clip" or clip["level"] != 0:
                 continue
             clipped, after = ext[k + 1], ext[k + 2] if k + 2 < len(ext) else None
             if clipped["type"] != "f" or clipped["level"] != 1 or (after is not None and after["level"] >= 1):
-                continue  # clips a stroke, or more than one entry: not an arrowhead
+                continue
+            found.append((clip, seq_to_path[clipped["seqno"]]))
+        return found
+
+    def _index_arrowheads(self) -> None:
+        """Clipped fills small enough to be arrowheads, represented by their clip area.
+
+        Candidates are clipped fills (_clipped_fills) whose clip is only l items, whose scissor
+        fits in ALIGN_HEAD_MAX_LEN and whose area is one polygon (clip_polygon). Sets head_polys,
+        head_path (index into self.paths of the fill), head_color (fill color), head_len and
+        head_width (long and short side of the min rotated rectangle, pt), and head_tree.
+        """
+        polys, head_path, head_color = [], [], []
+        for clip, i in self._clipped_fills():
             scissor = clip["scissor"]
             if {item[0] for item in clip["items"]} != {"l"} or max(scissor.width, scissor.height) > ALIGN_HEAD_MAX_LEN:
                 continue
@@ -697,8 +747,8 @@ class FloorPlanParser:
             if not isinstance(area, Polygon):
                 continue  # several separate shapes
             polys.append(area)
-            head_path.append(seq_to_path[clipped["seqno"]])
-            head_color.append(clipped["fill"])
+            head_path.append(i)
+            head_color.append(self.paths[i]["fill"])
         self.head_polys = np.array(polys)
         self.head_path = np.array(head_path, dtype=int)
         self.head_color = head_color
@@ -836,6 +886,136 @@ class FloorPlanParser:
             f"{len(set(shaped.tolist()) - used_heads)} of {len(shaped)} arrowhead-shaped clipped fills not in a marker"
         )
 
+    def get_callouts(self) -> None:
+        """Group each reference callout: circle, code, black parts, their outlines, view numbers
+        and masks.
+
+        A callout circle is a stroked path that circle_of accepts, with the center of exactly one
+        text line (the code) inside it. Its black parts are clipped fills (_clipped_fills) of the
+        circle's stroke color whose clip (only l items, one polygon) touches the circle within
+        CALLOUT_TOUCH_TOL from outside and fits in its diameter; a circle without one is not a
+        callout. Outlines are stroked paths of the circle's width and color lying entirely within
+        CALLOUT_TOUCH_TOL of the circle or a part's clip boundary. Each part has exactly one view
+        number (CALLOUT_NUMBER_RE) within CALLOUT_NUMBER_MAX_GAP. Text masks are found as in
+        get_measurements, at most one per text. Sets self.callouts, a list of {text, rect, items}
+        (items: sorted indices into self.paths; rect: [x0, y0, x1, y1], page space, pt), and
+        self.unclassified_callouts, a list of {text, bbox (the circle's), reason}. Uses only
+        self.paths and the text, so it does not need parse().
+        """
+        self._index_masks()
+        circ_path, centers, radii = [], [], []
+        for i, path in enumerate(self.paths):
+            found = circle_of(path) if "s" in path["type"] else None
+            if found is not None:
+                circ_path.append(i)
+                centers.append(found[0])
+                radii.append(found[1])
+        circ_path = np.array(circ_path, dtype=int)
+        disks = shapely.buffer(shapely.points(np.array(centers).reshape(-1, 2)), np.array(radii), quad_segs=64)
+        ci, wi = STRtree(shapely.centroid(self.word_bboxes)).query(disks, predicate="contains")
+        texts_in = defaultdict(list)  # circle -> text lines with their center inside it
+        for c, k in zip(ci.tolist(), wi.tolist()):
+            texts_in[c].append(k)
+        coded = sorted(c for c, ks in texts_in.items() if len(ks) == 1)
+
+        # Black part candidates: clipped fills whose clip is one polygon of l items.
+        part_polys, part_path = [], []
+        for clip, i in self._clipped_fills():
+            if {item[0] for item in clip["items"]} != {"l"} or self.paths[i]["fill"] is None:
+                continue
+            area = clip_polygon(clip["items"])
+            if isinstance(area, Polygon):
+                part_polys.append(area)
+                part_path.append(i)
+        part_polys, part_path = np.array(part_polys, dtype=object), np.array(part_path, dtype=int)
+        rings = np.array([path_line(self.paths[circ_path[c]]) for c in coded], dtype=object)
+        ri, pi = STRtree(part_polys).query(rings, predicate="dwithin", distance=CALLOUT_TOUCH_TOL)
+        size = np.ptp(shapely.bounds(part_polys[pi]).reshape(-1, 2, 2), axis=1).max(axis=1)
+        inner = shapely.buffer(disks[np.array(coded, dtype=int)[ri]], -CALLOUT_TOUCH_TOL)
+        ok = (
+            np.array(
+                [np.allclose(self.paths[part_path[p]]["fill"], self.paths[circ_path[coded[r]]]["color"]) for r, p in zip(ri, pi)],
+                dtype=bool,
+            )
+            & (size <= 2 * np.array(radii)[np.array(coded, dtype=int)[ri]])
+            & ~shapely.intersects(part_polys[pi], inner)
+        )
+        ri, pi = ri[ok], pi[ok]
+
+        # Outline candidates: stroked paths of only l and c items.
+        line_path = np.array(
+            [i for i, p in enumerate(self.paths) if "s" in p["type"] and p["items"] and {it[0] for it in p["items"]} <= {"l", "c"}],
+            dtype=int,
+        )
+        line_tree = STRtree(np.array([path_line(self.paths[i]) for i in line_path], dtype=object))
+        num_tree = STRtree(self.word_bboxes)
+
+        self.callouts, self.unclassified_callouts = [], []
+        claimed: dict[int, str] = {}  # path index -> bbox of the circle that owns it
+        used_parts: set[int] = set()
+        n_bare = 0
+        for r, c in enumerate(coded):
+            circle = self.paths[circ_path[c]]
+            k = texts_in[c][0]
+            text = str(self.word_texts[k])
+            unclassified = {"text": text, "bbox": [round(float(v), 3) for v in circle["rect"]]}
+            parts = pi[ri == r]
+            if len(parts) == 0:
+                n_bare += 1
+                continue
+            zone = shapely.buffer(
+                shapely.union_all([rings[r]] + [p.exterior for p in part_polys[parts]]), CALLOUT_TOUCH_TOL
+            )
+            lines = line_path[line_tree.query(zone, predicate="contains")]
+            lines = [
+                int(i)
+                for i in lines
+                if np.isclose(self.paths[i]["width"], circle["width"])
+                and np.allclose(self.paths[i]["color"], circle["color"])
+            ]
+            numbers, reason = [], None
+            for p in parts:
+                near = num_tree.query(part_polys[p], predicate="dwithin", distance=CALLOUT_NUMBER_MAX_GAP)
+                near = [int(n) for n in near if CALLOUT_NUMBER_RE.fullmatch(str(self.word_texts[n]))]
+                if len(near) != 1:
+                    reason = f"{len(near)} view numbers at a black part"
+                    break
+                numbers += near
+            if reason is None and len(set(numbers)) != len(numbers):
+                reason = "black parts share a view number"
+            masks = []
+            if reason is None:
+                for t in [k] + numbers:
+                    bbox = self.word_bboxes[t]
+                    cand = self.mask_tree.query(bbox, predicate="intersects")
+                    cover = shapely.area(shapely.intersection(self.mask_polys[cand], bbox)) / bbox.area
+                    ratio = shapely.area(self.mask_polys[cand]) / bbox.area
+                    found = self.mask_path[cand[(cover >= MASK_MIN_COVER) & (ratio <= MASK_MAX_AREA_RATIO)]]
+                    if len(found) > 1:
+                        reason = f"{len(found)} candidate masks {found.tolist()} for {self.word_texts[t]!r}"
+                        break
+                    masks += found.tolist()
+            if reason is not None:
+                self.unclassified_callouts.append({**unclassified, "reason": reason})
+                continue
+            items = sorted({int(circ_path[c]), *part_path[parts].tolist(), *lines, *masks})
+            taken = sorted({claimed[p] for p in items if p in claimed})
+            if taken:
+                reason = f"paths already used by callouts at {taken}"
+                self.unclassified_callouts.append({**unclassified, "reason": reason})
+                continue
+            claimed.update({p: str(unclassified["bbox"]) for p in items})
+            used_parts.update(parts.tolist())
+            boxes = [self.word_bboxes[t].bounds for t in [k] + numbers]
+            rect = union_rect(boxes + [self.paths[p]["rect"] for p in items])
+            self.callouts.append({"text": text, "rect": rect, "items": items})
+        print(
+            f"callouts: {len(coded)} circles around one text, {len(self.callouts)} grouped, "
+            f"{len(self.unclassified_callouts)} unclassified, {n_bare} without a black part; "
+            f"{len(set(pi.tolist()) - used_parts)} of {len(set(pi.tolist()))} black parts touching "
+            f"a circle not in a callout"
+        )
+
     def draw(self, out_dir: Path) -> None:
         debug_dir = out_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -851,28 +1031,32 @@ class FloorPlanParser:
             raise RuntimeError("call get_tags() before draw()")
         if not hasattr(self, "align_markers"):
             raise RuntimeError("call get_align_markers() before draw()")
+        if not hasattr(self, "callouts"):
+            raise RuntimeError("call get_callouts() before draw()")
         grid = [style_key(path) == self.grid_key for path in self.paths]
         meas = {i for group in self.measurements for i in group["items"]}
         tags = {i for group in self.tags for i in group["items"]}
         align = {i for group in self.align_markers for i in group["items"]}
-        drop = [g or i in meas or i in tags or i in align for i, g in enumerate(grid)]
+        callouts = {i for group in self.callouts for i in group["items"]}
+        drop = [g or i in meas or i in tags or i in align or i in callouts for i, g in enumerate(grid)]
         remove_items(out[0], self.paths, drop, drop_text=True)
         out[0].set_cropbox(pymupdf.Rect(self.drawing_area.bounds))
         out.save(out_dir / "drawing.pdf", garbage=3, deflate=True)
         print(f"{out_dir}: removed all text, {sum(grid)} grid line paths, {len(self.measurements)} "
-              f"measurement groups ({len(meas)} paths), {len(self.tags)} tags ({len(tags)} paths), and "
+              f"measurement groups ({len(meas)} paths), {len(self.tags)} tags ({len(tags)} paths), "
               f"{len(self.align_markers)} ALIGN markers ({len(align)} paths), "
+              f"and {len(self.callouts)} callouts ({len(callouts)} paths), "
               f"cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
         self.write_unclassified(out_dir / "unclassified.yaml")
         # TODO@Claude Remove the remaining annotations as whole groups: title block, legend, enclosing
-        # labels, callouts. (All text, grid lines, measurements, tags and ALIGN markers are done.)
+        # labels. (All text, grid lines, measurements, tags, ALIGN markers and callouts are done.)
         # Delete specific drawing items; never redact a bbox. Unclassifiable items stay (unclassified.yaml).
         # Save the remaining primitive geoms in self.prim (label geometry stays in self.enc_labels).
 
 
     def write_unclassified(self, path: Path) -> None:
-        """Write the measurement texts, tags and ALIGN markers that could not be grouped (left in the
-        drawing) as YAML."""
+        """Write the measurement texts, tags, ALIGN markers and callouts that could not be grouped
+        (left in the drawing) as YAML."""
         items = [
             {"kind": "measurement_text", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_measurements
@@ -882,6 +1066,9 @@ class FloorPlanParser:
         ] + [
             {"kind": "align_marker", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_align_markers
+        ] + [
+            {"kind": "callout", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
+            for u in self.unclassified_callouts
         ]
         doc = {
             "source": self.page.parent.name,

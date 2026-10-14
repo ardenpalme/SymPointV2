@@ -1,13 +1,13 @@
-"""Build the measurement, tag or ALIGN marker fixtures: small crop PDFs of A-1-03-10 and candidate
-expected groups.
+"""Build the measurement, tag, ALIGN marker or callout fixtures: small crop PDFs of A-1-03-10 and
+candidate expected groups.
 
 Usage, from the repo root:
-    python -m tests.make_fixtures --kind {measurements,tags,align} --review-dir DIR
+    python -m tests.make_fixtures --kind {measurements,tags,align,callouts} --review-dir DIR
 
 Writes tests/fixtures/<crop>.pdf, tests/expected/<crop>/<kind>.json, and DIR/<crop>.png
 with the candidate groups overlaid (one color per group, rect dashed, leader_rect dotted).
-The JSON files are candidates: they are produced by get_measurements(), get_tags() or
-get_align_markers() itself and become expected outputs only after a human has reviewed the PNGs.
+The JSON files are candidates: they are produced by get_measurements(), get_tags(),
+get_align_markers() or get_callouts() itself and become expected outputs only after a human has reviewed the PNGs.
 Rerunning overwrites the crops of that kind only.
 
 A crop keeps only the drawing items whose rect (inflated by half the stroke width) meets its
@@ -71,6 +71,16 @@ ALIGN_CROPS = {
     ],  # two markers next to each other
     "align_long": [("ALIGN", (1944.0, 1597.0))],  # 148 pt crossbar
 }
+# Crop stem -> callouts the crop must contain, each as (code, a point inside its rect on the page, pt).
+CALLOUT_CROPS = {
+    "callout_corner_one": [("A-4.03.51", (1745.0, 1239.0))],  # one black corner
+    "callout_corners_three": [("A-4.03.50", (1985.0, 1580.0))],  # three black corners
+    "callout_pointer_one": [("A-4.03.52", (653.0, 1222.0))],  # one pointer sticking out of the circle
+    "callout_pointers_two": [("A-4.03.52", (574.0, 1216.0))],  # two pointers, wall lines through the bbox
+    "callout_parts_scattered": [
+        ("A-4.03.51", (1124.0, 863.0))
+    ],  # parts far apart in drawing order, next to a tag and a measurement
+}
 COLORS = [
     (0.9, 0, 0),
     (0, 0.6, 0),
@@ -97,7 +107,7 @@ def select_measurements(groups: list[dict], texts: list[str]) -> list[dict]:
 def select_tags(
     groups: list[dict], picks: list[tuple[str, tuple[float, float]]]
 ) -> list[dict]:
-    """The one tag or ALIGN marker per (text, point) whose rect contains the point."""
+    """The one tag, ALIGN marker or callout per (text, point) whose rect contains the point."""
     selected = []
     for text, point in picks:
         matches = [
@@ -229,7 +239,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--kind", choices=["measurements", "tags", "align"], required=True)
+    parser.add_argument("--kind", choices=["measurements", "tags", "align", "callouts"], required=True)
     parser.add_argument("--review-dir", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -241,14 +251,17 @@ def main(argv: list[str] | None = None) -> None:
         if args.kind == "tags":
             fp.get_tags()
             return fp.tags, fp.unclassified_tags
-        fp.get_align_markers()
-        return fp.align_markers, fp.unclassified_align_markers
+        if args.kind == "align":
+            fp.get_align_markers()
+            return fp.align_markers, fp.unclassified_align_markers
+        fp.get_callouts()
+        return fp.callouts, fp.unclassified_callouts
 
     source = pymupdf.open(SOURCE)
     full_groups, _ = groups_of(FloorPlanParser(source[0]))
     FIXTURES.mkdir(parents=True, exist_ok=True)
     args.review_dir.mkdir(parents=True, exist_ok=True)
-    crops = {"measurements": CROPS, "tags": TAG_CROPS, "align": ALIGN_CROPS}[args.kind]
+    crops = {"measurements": CROPS, "tags": TAG_CROPS, "align": ALIGN_CROPS, "callouts": CALLOUT_CROPS}[args.kind]
     for stem, picks in crops.items():
         if args.kind == "measurements":
             selected = select_measurements(full_groups, picks)
