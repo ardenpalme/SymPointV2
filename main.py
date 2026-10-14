@@ -37,6 +37,7 @@ def main() -> None:
             out_dir.mkdir(parents=True, exist_ok=True)
             parser = FloorPlanParser(page)
             parser.parse()
+            parser.get_measurements()
             parser.draw(out_dir)
 
 

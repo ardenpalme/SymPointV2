@@ -44,22 +44,26 @@ def display_geoms(page, geoms, fname, show_bg=True, crop=None):
 def remove_items(
     page: pymupdf.Page, paths: list[dict], drop_path: Sequence[bool], drop_text: bool
 ) -> None:
-    """Delete all text (if drop_text) and the stroked paths flagged in drop_path from page.
+    """Delete all text (if drop_text) and the paths flagged in drop_path from page.
 
     paths is page.get_drawings() of an identical page and drop_path is aligned with it.
-    MuPDF's sanitize filter calls the culler once per stroked path, in content order, with
-    only its bbox, so the k-th stroke call is the k-th path whose type contains "s". Every
-    call is checked against that path's rect inflated by width/2 (page space, pt).
-    Only plain stroked paths ("s") can be dropped; an "fs" would lose its fill too.
+    MuPDF's sanitize filter calls the culler once per fill and once per stroke, in content
+    order, with only its bbox: the k-th fill call is the k-th path whose type contains "f"
+    and the k-th stroke call the k-th path whose type contains "s" (an "fs" path gets one
+    of each). Fill calls are checked against the path's rect, stroke calls against the rect
+    inflated by width/2 (page space, pt). Dropping an "fs" path drops both its fill and stroke.
     """
     if len(drop_path) != len(paths):
         raise ValueError(f"drop_path has {len(drop_path)} entries for {len(paths)} paths")
-    strokes = [(p, d) for p, d in zip(paths, drop_path) if "s" in p["type"]]
-    for p, d in zip(paths, drop_path):
-        if d and p["type"] != "s":
-            raise ValueError(f"can only drop stroke-only paths, got type {p['type']!r}: {p['rect']}")
+    # Paths in content order per culler kind: "f" gets fill calls, "s" stroke calls.
+    queues = {kind: [(p, d) for p, d in zip(paths, drop_path) if kind in p["type"]] for kind in "fs"}
+    call_kinds = {
+        mupdf.FZ_CULL_PATH_FILL: "f",
+        mupdf.FZ_CULL_PATH_STROKE: "s",
+        mupdf.FZ_CULL_PATH_FILL_STROKE: "fs",  # one call for a "B" operator
+    }
     to_page = page.transformation_matrix  # culler bboxes are in PDF space (y up)
-    calls = 0
+    calls = {kind: 0 for kind in "fs"}
     # Exceptions raised inside the culler are swallowed by MuPDF, so record the first
     # mismatch, keep everything from then on, and raise after filtering.
     errors: list[str] = []
@@ -70,23 +74,27 @@ def remove_items(
             self.use_virtual_culler()
 
         def culler(self, ctx, bbox, cull_type):
-            nonlocal calls
             if cull_type == mupdf.FZ_CULL_GLYPH:
                 return int(drop_text)
-            if cull_type != mupdf.FZ_CULL_PATH_STROKE:
+            kinds = call_kinds.get(cull_type)
+            if kinds is None:
                 return 0
-            calls += 1
+            matched = []
+            for kind in kinds:
+                calls[kind] += 1
+                if calls[kind] <= len(queues[kind]):
+                    matched.append(queues[kind][calls[kind] - 1])
             if errors:
                 return 0
-            if calls > len(strokes):
-                errors.append(f"more stroke calls than the {len(strokes)} stroked paths")
+            if len(matched) != len(kinds) or any(m[0] is not matched[0][0] for m in matched):
+                errors.append(f"culler call {kinds!r} #{calls} has no matching path")
                 return 0
-            path, drop = strokes[calls - 1]
+            path, drop = matched[0]
             got = pymupdf.Rect(mupdf.FzRect(bbox)) * to_page
-            half = path["width"] / 2
+            half = path["width"] / 2 if "s" in kinds else 0.0
             want = path["rect"] + (-half, -half, half, half)
             if max(abs(a - b) for a, b in zip(got, want)) > BBOX_TOL:
-                errors.append(f"stroke call {calls - 1}: bbox {got} does not match path {want}")
+                errors.append(f"culler call {kinds!r} #{calls}: bbox {got} does not match path {want}")
                 return 0
             return int(drop)
 
@@ -109,6 +117,7 @@ def remove_items(
     pdf_page = mupdf.pdf_page_from_fz_page(page.this)
     mupdf.pdf_filter_page_contents(pdf_page.doc(), pdf_page, opts)
     if errors:
-        raise RuntimeError(f"stroke order mismatch, page left unusable: {errors[0]}")
-    if calls != len(strokes):
-        raise RuntimeError(f"{calls} stroke calls for {len(strokes)} stroked paths")
+        raise RuntimeError(f"path order mismatch, page left unusable: {errors[0]}")
+    for kind in "fs":
+        if calls[kind] != len(queues[kind]):
+            raise RuntimeError(f"{calls[kind]} {kind!r} culler calls for {len(queues[kind])} paths")

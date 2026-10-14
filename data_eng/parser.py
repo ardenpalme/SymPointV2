@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pymupdf
 import shapely
+import yaml
 from shapely import LineString, Polygon, STRtree
 from shapely.ops import linemerge, polygonize
 from tqdm import tqdm
@@ -18,6 +20,20 @@ from .utils import display_geoms, remove_items
 THRSH = 3.0
 ANGLE_TOL = 3.0
 
+# Measurement grouping. Ranges in comments were measured in A-1-03-10 (pt = PDF points).
+MEAS_TEXT_RE = re.compile(r"\d+(\.\d+)? ?mm")  # whole text of a dimension label, e.g. "1691 mm"
+JOIN_TOL = 0.5  # pt; max gap between consecutive leader pieces
+TICK_MAX_LEN = 7.0  # pt; ticks are 5.9-6.1 pt long
+TICK_END_TOL = 0.5  # pt; ticks are drawn as two halves that start where they cross the line (0-0.12)
+OVERSHOOT_MAX = 4.0  # pt; dimension lines run 2.7-2.9 pt past their end ticks, extension lines past the line
+EXT_OVERSHOOT_MIN = 2.0  # pt; extension lines run 2.7-2.9 pt past the dimension line
+EXT_TOL = 0.5  # pt; max distance from an extension line to its tick crossing (0-0.09)
+CENTER_TOL = 0.25  # fraction of the dimension line's length; text centers are 0.00-0.14 off its middle
+LEADER_MAX_SEGS = 50  # pieces in one leader chain
+LEADER_MAX_TURN = 60.0  # degrees; max change of direction from one leader piece to the next
+MASK_MIN_COVER = 0.9  # fraction of the text bbox area a mask covers; masks cover 0.97-0.99
+MASK_MAX_AREA_RATIO = 1.75  # mask area / text bbox area; masks are 1.12-1.49
+
 
 def style_key(path: dict) -> tuple | None:
     """(color, width) of a get_drawings() path, rounded to 4 decimals; None if either is None."""
@@ -27,11 +43,51 @@ def style_key(path: dict) -> tuple | None:
     return (tuple(round(ele, 4) for ele in path_color), round(path_width, 4))
 
 
+def angle_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Angle between undirected lines with angles a and b (degrees), folded into [0, 90]."""
+    d = np.abs(np.asarray(a) - np.asarray(b)) % 180
+    return np.minimum(d, 180 - d)
+
+
+def union_rect(rects: list) -> list[float]:
+    """Bounding [x0, y0, x1, y1] of (x0, y0, x1, y1) rects, rounded to 3 decimals (pt)."""
+    arr = np.array([tuple(r) for r in rects], dtype=float)
+    out = [arr[:, 0].min(), arr[:, 1].min(), arr[:, 2].max(), arr[:, 3].max()]
+    return [round(float(v), 3) for v in out]
+
+
+def words_from_blocks(blocks: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per text line of get_text("dict") blocks: bbox polygon, text, and angle in whole degrees.
+
+    The angle is atan2 of the line's dir in page space (y down), so text read upward is negative.
+    Rotated lines get their quad as bbox, axis-aligned lines their rect.
+    """
+    word_bboxes = []
+    word_texts = []
+    angles = []
+
+    for block in blocks:
+        for line in block.get("lines", []):
+            cos, sin = line["dir"]
+            angles.append(round(math.degrees(math.atan2(sin, cos))))
+            if cos == 0 or sin == 0:
+                bbox = shapely.geometry.box(*line["bbox"])
+            else:
+                q = pymupdf.recover_line_quad(line)
+                bbox = Polygon([q.ul, q.ur, q.lr, q.ll])
+            text = "".join(span["text"] for span in line["spans"])
+            word_bboxes.append(bbox)
+            word_texts.append(text)
+
+    return np.array(word_bboxes), np.array(word_texts), np.array(angles)
+
+
 class FloorPlanParser:
     def __init__(self, page) -> None:
         self.page = page
         self.paths = page.get_drawings()
         self.blocks = page.get_text("dict")["blocks"]
+        self.word_bboxes, self.word_texts, self.word_angles = words_from_blocks(self.blocks)
 
     def parse(self):
         lines, curves, rects = defaultdict(list), defaultdict(list), defaultdict(list)
@@ -98,27 +154,6 @@ class FloorPlanParser:
         self.lines = ls
         self.lines_tree = STRtree(self.lines)
 
-        word_bboxes = []
-        word_texts = []
-        angles = []
-
-        for block in self.blocks:
-            for line in block.get("lines", []):
-                cos, sin = line["dir"]
-                angles.append(round(math.degrees(math.atan2(sin, cos))))
-                if cos == 0 or sin == 0:
-                    bbox = shapely.geometry.box(*line["bbox"])
-                else:
-                    q = pymupdf.recover_line_quad(line)
-                    bbox = Polygon([q.ul, q.ur, q.lr, q.ll])
-                text = "".join(span["text"] for span in line["spans"])
-                word_bboxes.append(bbox)
-                word_texts.append(text)
-
-        self.word_bboxes = np.array(word_bboxes)
-        self.word_texts = np.array(word_texts)
-        self.word_angles = np.array(angles)
-
         word_idx, sh_idx = self.conv_tree.query(self.word_bboxes, predicate="intersects")
         overlap = shapely.area(shapely.intersection(self.conv_sh[sh_idx], self.word_bboxes[word_idx]))
         word_share = overlap / shapely.area(self.word_bboxes[word_idx])
@@ -126,24 +161,300 @@ class FloorPlanParser:
         keep = (word_share > 0.40) & (shape_share > 0.1)
         self.enc_labels = self.conv_sh[sh_idx[keep]]
 
-    def get_measurements(self):
-        mask_align = np.strings.find(self.word_texts, 'ALIGN') == 0
-        mask_meas = np.strings.find(self.word_texts, 'mm') >= 0
-        mask = (mask_meas | mask_align)
-        w_bbox_dist = self.word_bboxes[mask]  # noqa: F841
+    def _index_segments(self) -> None:
+        """One straight segment per l item (and per c item, as its chord) of every stroked path.
 
-        bbox_idx, line_idx = self.lines_tree.query(self.word_bboxes[mask], predicate="dwithin", distance=THRSH)
-        ends = np.array([[line.coords[0], line.coords[-1]] for line in self.lines])
-        dx = ends[:, 1, 0] - ends[:, 0, 0]
-        dy = ends[:, 1, 1] - ends[:, 0, 1]
-        line_angles = np.degrees(np.arctan2(dy, dx))
-        diff = np.abs(line_angles[line_idx] - self.word_angles[bbox_idx]) % 180
-        diff = np.minimum(diff, 180 - diff)
-        parallel = diff <= ANGLE_TOL
-        line_idx, word_idx = line_idx[parallel], bbox_idx[parallel]  # noqa: F841
+        Sets seg_geoms, seg_path (index into self.paths), seg_xy (n, 2, 2), seg_angle (degrees,
+        page space), seg_len (pt), seg_tree, and path_segs (path index -> its segment indices).
+        """
+        geoms, seg_path, n_items = [], [], []
+        for i, path in enumerate(self.paths):
+            n_items.append(len(path["items"]))
+            if "s" not in path["type"]:
+                continue
+            for item in path["items"]:
+                kind = item[0]
+                if kind == "l":
+                    pts = (item[1], item[2])
+                elif kind == "c":
+                    pts = (item[1], item[4])
+                elif kind in ("re", "qu"):
+                    continue  # never part of a measurement; keeps its path out of every group
+                else:
+                    raise ValueError("unhandled drawing", item)
+                geoms.append(LineString([tuple(pts[0]), tuple(pts[1])]))
+                seg_path.append(i)
+        self.seg_geoms = np.array(geoms)
+        self.seg_path = np.array(seg_path, dtype=int)
+        self.seg_xy = shapely.get_coordinates(self.seg_geoms).reshape(-1, 2, 2)
+        d = self.seg_xy[:, 1] - self.seg_xy[:, 0]
+        self.seg_angle = np.degrees(np.arctan2(d[:, 1], d[:, 0]))
+        self.seg_len = np.hypot(d[:, 0], d[:, 1])
+        self.seg_tree = STRtree(self.seg_geoms)
+        self.path_n_items = np.array(n_items)
+        self.path_segs = defaultdict(list)
+        for k, i in enumerate(self.seg_path):
+            self.path_segs[int(i)].append(k)
 
-        # TODO@Claude finish this function to group the architectural measurements lines next to or pointed to from w_bbox_dist
-        # sometimes the measurement lines are parallel to w_bbox_dist, and sometimes there is a pointer from the w_bbox_dist boxes to the measurement lines
+    def _index_masks(self) -> None:
+        """Polygons of fill-only paths made of one re/qu item or only l items (text mask candidates)."""
+        polys, mask_path = [], []
+        for i, path in enumerate(self.paths):
+            if path["type"] != "f":
+                continue
+            items = path["items"]
+            kinds = {item[0] for item in items}
+            if not kinds <= {"l", "c", "re", "qu"}:
+                raise ValueError("unhandled drawing", items)
+            if len(items) == 1 and kinds <= {"re", "qu"}:
+                q = items[0][1].quad if items[0][0] == "re" else items[0][1]
+                poly = Polygon([q.ul, q.ur, q.lr, q.ll])
+            elif kinds == {"l"}:
+                poly = Polygon([tuple(item[1]) for item in items] + [tuple(items[-1][2])])
+            else:
+                continue  # curved or mixed fills are not text masks
+            polys.append(poly)
+            mask_path.append(i)
+        self.mask_polys = np.array(polys)
+        self.mask_path = np.array(mask_path, dtype=int)
+        self.mask_tree = STRtree(self.mask_polys)
+
+    def _dimension_lines(self, cand: np.ndarray) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Candidates that are dimension lines: a tick within OVERSHOOT_MAX of each end.
+
+        A tick is a segment at 45 deg to the line (within ANGLE_TOL), at most TICK_MAX_LEN long,
+        with an end within TICK_END_TOL of the line (a slash is two halves starting on the line).
+        Its crossing is that end projected onto the line. Returns {segment: (crossings at the two
+        ends (2, 2), their positions along the line (2,), end tick segments)}.
+        """
+        cand = np.unique(np.asarray(cand, dtype=int))
+        if len(cand) == 0:
+            return {}
+        ci, ti = self.seg_tree.query(self.seg_geoms[cand], predicate="dwithin", distance=TICK_END_TOL)
+        line = cand[ci]
+        ok = (
+            (ti != line)
+            & (np.abs(angle_diff(self.seg_angle[ti], self.seg_angle[line]) - 45) <= ANGLE_TOL)
+            & (self.seg_len[ti] <= TICK_MAX_LEN)
+        )
+        line, ti = line[ok], ti[ok]
+        tick_ends = shapely.points(self.seg_xy[ti])  # (m, 2)
+        gap = shapely.distance(tick_ends, self.seg_geoms[line][:, None])
+        near_end = gap.argmin(axis=1)
+        ok = gap.min(axis=1) <= TICK_END_TOL
+        line, ti, near_end = line[ok], ti[ok], near_end[ok]
+        pos = shapely.line_locate_point(self.seg_geoms[line], tick_ends[ok, near_end])
+        cross_xy = shapely.get_coordinates(shapely.line_interpolate_point(self.seg_geoms[line], pos))
+        at_start = pos <= OVERSHOOT_MAX
+        at_end = self.seg_len[line] - pos <= OVERSHOOT_MAX
+        found = {}
+        for j in np.unique(line):
+            m = line == j
+            s, e = m & at_start, m & at_end
+            if not (s.any() and e.any()):
+                continue
+            ends = np.array([cross_xy[s].mean(axis=0), cross_xy[e].mean(axis=0)])
+            found[int(j)] = (ends, np.array([pos[s].mean(), pos[e].mean()]), np.unique(ti[s | e]))
+        return found
+
+    def _extension_lines(self, j: int, ends: np.ndarray) -> np.ndarray:
+        """Extension line pieces at the end crossings `ends` of dimension line j.
+
+        A piece is perpendicular to j (within ANGLE_TOL), passes within EXT_TOL of a crossing, and
+        either crosses j and runs EXT_OVERSHOOT_MIN..OVERSHOOT_MAX past it, or ends at the crossing
+        and is that short (the overshoot of a line split at the crossing), or ends at the crossing
+        opposite such an overshoot piece. Pieces whose far end joins a line that is neither
+        collinear nor a tick are wall edges and are left out.
+        """
+        ei, si = self.seg_tree.query(shapely.points(ends), predicate="dwithin", distance=EXT_TOL)
+        ok = (si != j) & (np.abs(angle_diff(self.seg_angle[si], self.seg_angle[j]) - 90) <= ANGLE_TOL)
+        ei, si = ei[ok], si[ok]
+        d = self.seg_xy[j, 1] - self.seg_xy[j, 0]
+        normal = np.array([-d[1], d[0]]) / np.linalg.norm(d)
+        off = (self.seg_xy[si] - ends[ei][:, None]) @ normal  # (m, 2): end offsets from line j, pt
+        near, far = np.abs(off).min(axis=1), np.abs(off).max(axis=1)
+        crosses = (off.min(axis=1) < -EXT_TOL) & (off.max(axis=1) > EXT_TOL)
+        short = (EXT_OVERSHOOT_MIN <= near) & (near <= OVERSHOOT_MAX)
+        at_cross = ~crosses & (near <= EXT_TOL)
+        overshoot = at_cross & (EXT_OVERSHOOT_MIN <= far) & (far <= OVERSHOOT_MAX)
+        side = np.sign(off[np.arange(len(off)), np.abs(off).argmax(axis=1)])
+        opposite = np.array(
+            [((ei == e) & overshoot & (side == -sd)).any() for e, sd in zip(ei, side)], dtype=bool
+        )
+        keep = (crosses & short) | overshoot | (at_cross & (far > OVERSHOOT_MAX) & opposite)
+        ei, si, off = ei[keep], si[keep], off[keep]
+        far_xy = self.seg_xy[si, np.abs(off).argmax(axis=1)]
+        fi, ni = self.seg_tree.query(shapely.points(far_xy), predicate="dwithin", distance=JOIN_TOL)
+        gap = np.linalg.norm(self.seg_xy[ni] - far_xy[fi][:, None], axis=2).min(axis=1)
+        joined = (
+            (ni != si[fi])
+            & (gap <= JOIN_TOL)
+            & (angle_diff(self.seg_angle[ni], self.seg_angle[si[fi]]) > ANGLE_TOL)
+            & ~((np.abs(angle_diff(self.seg_angle[ni], self.seg_angle[si[fi]]) - 45) <= ANGLE_TOL)
+                & (self.seg_len[ni] <= TICK_MAX_LEN))
+        )
+        wall = np.isin(np.arange(len(si)), fi[joined])
+        return np.unique(si[~wall])
+
+    def _leader_end(self, xy: np.ndarray, heading: float, exclude: list[int]) -> tuple[str, int]:
+        """What a leader's free end at xy touches: ("dim", line), ("next", segment) or ("fail", -1).
+
+        "dim" when xy lies within JOIN_TOL of exactly one dimension line, more than JOIN_TOL inside
+        its end crossings (an extension line ends exactly on a crossing).
+        Otherwise "next" when exactly one other piece starts within JOIN_TOL of xy and turns at
+        most LEADER_MAX_TURN from heading (degrees, direction the leader arrived in).
+        """
+        point = shapely.points(xy)
+        near = self.seg_tree.query(point, predicate="dwithin", distance=JOIN_TOL)
+        near = near[~np.isin(near, exclude)]
+        hits = []
+        for j, (_, span, _) in self._dimension_lines(near).items():
+            pos = shapely.line_locate_point(self.seg_geoms[j], point)
+            if span.min() + JOIN_TOL < pos < span.max() - JOIN_TOL:
+                hits.append(j)
+        if len(hits) == 1:
+            return "dim", hits[0]
+        if hits:
+            return "fail", -1
+        gaps = np.linalg.norm(self.seg_xy[near] - xy, axis=2)  # (m, 2)
+        joined = gaps.min(axis=1) <= JOIN_TOL
+        near, gaps = near[joined], gaps[joined]
+        other = self.seg_xy[near, gaps.argmax(axis=1)]
+        out = np.degrees(np.arctan2(other[:, 1] - xy[1], other[:, 0] - xy[0]))
+        turn = np.abs((out - heading + 180) % 360 - 180)
+        nxt = near[turn <= LEADER_MAX_TURN]
+        if len(nxt) == 1:
+            return "next", int(nxt[0])
+        return "fail", -1
+
+    def _find_leader(self, k: int) -> tuple[list[int], int] | str:
+        """Leader from text k to a dimension line: (leader segments, line), or a failure reason.
+
+        Starts from every segment with an endpoint within THRSH of the text bbox boundary and
+        follows pieces joined end to end. All chains that reach a dimension line must be parts
+        of the longest one (a leader can start next to the text with more than one piece).
+        """
+        bbox = self.word_bboxes[k]
+        boundary = bbox.exterior
+        found = []
+        for s in self.seg_tree.query(boundary, predicate="dwithin", distance=THRSH):
+            ends = self.seg_xy[s]
+            if shapely.distance(shapely.points(ends), boundary).min() > THRSH:
+                continue
+            far = int(np.argmax(shapely.distance(shapely.points(ends), bbox)))
+            prev, free = ends[1 - far], ends[far]
+            chain = [int(s)]
+            for _ in range(LEADER_MAX_SEGS):
+                heading = math.degrees(math.atan2(free[1] - prev[1], free[0] - prev[0]))
+                what, j = self._leader_end(free, heading, chain)
+                if what == "dim":
+                    found.append((chain, j))
+                    break
+                if what == "fail":
+                    break
+                chain.append(j)
+                ends = self.seg_xy[j]
+                far = int(np.argmax(np.linalg.norm(ends - free, axis=1)))
+                prev, free = free, ends[far]
+        if not found:
+            return "no leader found"
+        chain, j = max(found, key=lambda f: len(f[0]))
+        if any(fj != j or not set(fc) <= set(chain) for fc, fj in found):
+            return f"{len(found)} possible leaders"
+        return chain, j
+
+    def _group_paths(self, segs: np.ndarray) -> tuple[list[int], list[int]]:
+        """Paths of segs split into (complete, partial): partial paths have items outside segs."""
+        segs = {int(s) for s in segs}
+        complete, partial = [], []
+        for p in sorted({int(self.seg_path[s]) for s in segs}):
+            whole = len(self.path_segs[p]) == self.path_n_items[p] and segs.issuperset(self.path_segs[p])
+            (complete if whole else partial).append(p)
+        return complete, partial
+
+    def get_measurements(self) -> None:
+        """Group each dimension text with its dimension line, ticks, extension lines, leader and mask.
+
+        Text next to its line (parallel, centered, within THRSH) or joined to it by a leader.
+        Sets self.measurements, a list of {text, rect, leader_rect, items}, where items are
+        sorted indices into self.paths and rects are [x0, y0, x1, y1] in page space (pt);
+        and self.unclassified_measurements, a list of {text, bbox, reason}. Uses only
+        self.paths and the text, so it does not need parse().
+        """
+        self._index_segments()
+        self._index_masks()
+        meas = np.flatnonzero([MEAS_TEXT_RE.fullmatch(t) is not None for t in self.word_texts])
+        bboxes = self.word_bboxes[meas]
+
+        # Case A: a parallel dimension line next to the text, with the text centered on it.
+        ti, si = self.seg_tree.query(bboxes, predicate="dwithin", distance=THRSH)
+        t = shapely.line_locate_point(self.seg_geoms[si], shapely.centroid(bboxes[ti]), normalized=True)
+        ok = (angle_diff(self.seg_angle[si], self.word_angles[meas][ti]) <= ANGLE_TOL) & (
+            np.abs(t - 0.5) <= CENTER_TOL
+        )
+        ti, si = ti[ok], si[ok]
+        dims = self._dimension_lines(si)
+        is_dim = np.isin(si, list(dims))
+        ti, si = ti[is_dim], si[is_dim]
+        dist = shapely.distance(self.seg_geoms[si], bboxes[ti])
+
+        # Text masks: covering most of the text bbox and not much larger than it.
+        mi, pi = self.mask_tree.query(bboxes, predicate="intersects")
+        cover = shapely.area(shapely.intersection(self.mask_polys[pi], bboxes[mi])) / shapely.area(bboxes[mi])
+        ratio = shapely.area(self.mask_polys[pi]) / shapely.area(bboxes[mi])
+        is_mask = (cover >= MASK_MIN_COVER) & (ratio <= MASK_MAX_AREA_RATIO)
+        mi, mask_paths = mi[is_mask], self.mask_path[pi[is_mask]]
+
+        self.measurements, self.unclassified_measurements = [], []
+        claimed: dict[int, str] = {}
+        for n, k in enumerate(meas):
+            text, bbox = str(self.word_texts[k]), self.word_bboxes[k]
+            unclassified = {"text": text, "bbox": [round(float(v), 3) for v in bbox.bounds]}
+            leader: list[int] = []
+            cands = si[ti == n]
+            if len(cands):
+                j = int(cands[np.argmin(dist[ti == n])])
+            else:
+                found = self._find_leader(int(k))
+                if isinstance(found, str):
+                    self.unclassified_measurements.append({**unclassified, "reason": found})
+                    continue
+                leader, j = found
+                if j not in dims:
+                    dims.update(self._dimension_lines(np.array([j])))
+            if j in claimed:
+                reason = f"dimension line already used by {claimed[j]!r}"
+                self.unclassified_measurements.append({**unclassified, "reason": reason})
+                continue
+            ends, _, ticks = dims[j]
+            body = np.concatenate([[j], ticks, self._extension_lines(j, ends)])
+            body_paths, body_partial = self._group_paths(body)
+            leader_paths, leader_partial = self._group_paths(np.array(leader, dtype=int))
+            if body_partial or leader_partial:
+                reason = f"paths {body_partial + leader_partial} have items outside the group"
+                self.unclassified_measurements.append({**unclassified, "reason": reason})
+                continue
+            masks = mask_paths[mi == n]
+            if len(masks) > 1:
+                reason = f"{len(masks)} candidate masks {masks.tolist()}"
+                self.unclassified_measurements.append({**unclassified, "reason": reason})
+                continue
+            claimed[j] = text
+            rect_paths = body_paths + masks.tolist()
+            leader_rect = union_rect([self.paths[p]["rect"] for p in leader_paths]) if leader else None
+            self.measurements.append(
+                {
+                    "text": text,
+                    "rect": union_rect([bbox.bounds] + [self.paths[p]["rect"] for p in rect_paths]),
+                    "leader_rect": leader_rect,
+                    "items": sorted(set(rect_paths + leader_paths)),
+                }
+            )
+        n_leader = sum(m["leader_rect"] is not None for m in self.measurements)
+        print(
+            f"measurements: {len(meas)} texts, {len(self.measurements) - n_leader} next to their line, "
+            f"{n_leader} with a leader, {len(self.unclassified_measurements)} unclassified"
+        )
 
     def draw(self, out_dir: Path) -> None:
         debug_dir = out_dir / "debug"
@@ -154,17 +465,37 @@ class FloorPlanParser:
         # Copy the page so self.page stays untouched; insert_pdf keeps mediabox and rotation.
         out = pymupdf.open()
         out.insert_pdf(self.page.parent, from_page=self.page.number, to_page=self.page.number)
-        drop = [style_key(path) == self.grid_key for path in self.paths]
+        if not hasattr(self, "measurements"):
+            raise RuntimeError("call get_measurements() before draw()")
+        grid = [style_key(path) == self.grid_key for path in self.paths]
+        meas = {i for group in self.measurements for i in group["items"]}
+        drop = [g or i in meas for i, g in enumerate(grid)]
         remove_items(out[0], self.paths, drop, drop_text=True)
         out[0].set_cropbox(pymupdf.Rect(self.drawing_area.bounds))
         out.save(out_dir / "drawing.pdf", garbage=3, deflate=True)
-        print(f"{out_dir}: removed all text and {sum(drop)} grid line paths, "
-              f"cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
+        print(f"{out_dir}: removed all text, {sum(grid)} grid line paths, and {len(self.measurements)} "
+              f"measurement groups ({len(meas)} paths), cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
+        self.write_unclassified(out_dir / "unclassified.yaml")
         # TODO@Claude Remove the remaining annotations as whole groups: title block, legend, enclosing
-        # labels, measurement groups, callouts, tags, ALIGN markers. (All text and grid lines are done.)
+        # labels, callouts, tags, ALIGN markers. (All text, grid lines and measurements are done.)
         # Delete specific drawing items; never redact a bbox. Unclassifiable items stay (unclassified.yaml).
         # Save the remaining primitive geoms in self.prim (label geometry stays in self.enc_labels).
 
+
+    def write_unclassified(self, path: Path) -> None:
+        """Write the measurement texts that could not be grouped (left in the drawing) as YAML."""
+        items = [
+            {"kind": "measurement_text", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
+            for u in self.unclassified_measurements
+        ]
+        doc = {
+            "source": self.page.parent.name,
+            "page": self.page.number,
+            "coordinate_space": "PyMuPDF page space, origin top-left, y down",
+            "units": "pt",
+            "items": items,
+        }
+        path.write_text(yaml.safe_dump(doc, sort_keys=False))
 
     def encode_prims(self, annot_path):
         '''
