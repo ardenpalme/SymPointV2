@@ -10,7 +10,7 @@ import numpy as np
 import pymupdf
 import shapely
 import yaml
-from shapely import LineString, Polygon, STRtree
+from shapely import LineString, MultiPolygon, Polygon, STRtree
 from shapely.ops import linemerge, polygonize
 from tqdm import tqdm
 
@@ -41,6 +41,15 @@ TAG_BAR_MAX_LEN = 10.0  # pt; end bars are 5.6-5.8 pt long
 TAG_LEADER_MAX_TURN = 100.0  # degrees; tag leaders bend by 45-90 (85 < max <= 90)
 TAG_BAR_MIN_WIDTH_RATIO = 3.0  # end bar stroke width / leader stroke width; 1.92 / 0.36 = 5.3
 
+# ALIGN marker grouping. Ranges in comments were measured in A-1-03-10.
+ALIGN_TEXT = "ALIGN"  # whole text of the marker's label
+SLIVER_MAX_AREA_FRAC = 0.05  # of a clip's area; stair steps at diagonal arrowhead tips are < 0.003
+SUBPATH_TOL = 1e-3  # pt; an item starting farther than this from the previous end starts a subpath
+ALIGN_TEXT_MAX_GAP = 4.0  # pt; crossbar to text bbox, 0.95-2.41
+ALIGN_LEG_MAX_LEN = 20.0  # pt; legs are 1.7-14 pt long
+ALIGN_HEAD_MAX_LEN = 12.0  # pt; long side of an arrowhead's min rotated rectangle, 8.7-9.1
+ALIGN_HEAD_MIN_ASPECT = 2.5  # arrowhead long side / short side; 2.2-2.3 pt wide, so about 3.9
+
 
 def style_key(path: dict) -> tuple | None:
     """(color, width) of a get_drawings() path, rounded to 4 decimals; None if either is None."""
@@ -54,6 +63,33 @@ def angle_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Angle between undirected lines with angles a and b (degrees), folded into [0, 90]."""
     d = np.abs(np.asarray(a) - np.asarray(b)) % 180
     return np.minimum(d, 180 - d)
+
+
+def clip_polygon(items: list) -> Polygon | MultiPolygon:
+    """The area of a clip path made of l items (page space, pt): a Polygon, or a MultiPolygon
+    if the clip has several separate shapes.
+
+    A new subpath starts where an item does not start at the previous item's end. Each subpath
+    is closed and made valid; polygon parts smaller than SLIVER_MAX_AREA_FRAC of the total area
+    (stair steps at diagonal arrowhead tips) are dropped. Raises ValueError for items other than l.
+    """
+    kinds = {item[0] for item in items}
+    if kinds != {"l"}:
+        raise ValueError(f"clip path with items {sorted(kinds)}, expected only l")
+    rings = [[tuple(items[0][1])]]
+    for prev, item in zip([None] + items[:-1], items):
+        if prev is not None and math.dist(item[1], prev[2]) > SUBPATH_TOL:
+            rings.append([tuple(item[1])])
+        rings[-1].append(tuple(item[2]))
+    parts = []
+    for ring in rings:
+        if len(ring) >= 3:
+            valid = shapely.make_valid(Polygon(ring))
+            flat = shapely.get_parts(shapely.get_parts(valid))  # make_valid nests one level deep
+            parts += [g for g in flat if g.geom_type == "Polygon"]
+    total = sum(g.area for g in parts)
+    kept = [g for g in parts if g.area > SLIVER_MAX_AREA_FRAC * total]
+    return shapely.union_all(kept)
 
 
 def union_rect(rects: list) -> list[float]:
@@ -633,6 +669,173 @@ class FloorPlanParser:
             f"{len(wide_paths - set(claimed))} of {len(wide_paths)} paths not in a tag"
         )
 
+    def _index_arrowheads(self) -> None:
+        """Clipped fills small enough to be arrowheads, represented by their clip area.
+
+        In get_drawings(extended=True) a level-0 clip followed directly by one level-1 fill-only
+        path clips that path. Candidates are clips of only l items whose scissor fits in
+        ALIGN_HEAD_MAX_LEN and whose area is one polygon (clip_polygon). Sets head_polys,
+        head_path (index into self.paths of the fill), head_color (fill color), head_len and
+        head_width (long and short side of the min rotated rectangle, pt), and head_tree.
+        """
+        ext = self.page.get_drawings(extended=True)
+        painted = [p["seqno"] for p in ext if p["type"] != "clip"]
+        if painted != [p["seqno"] for p in self.paths]:
+            raise RuntimeError("extended drawings do not match get_drawings() by seqno")
+        seq_to_path = {p["seqno"]: i for i, p in enumerate(self.paths)}
+        polys, head_path, head_color = [], [], []
+        for k, clip in enumerate(ext[:-1]):
+            if clip["type"] != "clip" or clip["level"] != 0:
+                continue
+            clipped, after = ext[k + 1], ext[k + 2] if k + 2 < len(ext) else None
+            if clipped["type"] != "f" or clipped["level"] != 1 or (after is not None and after["level"] >= 1):
+                continue  # clips a stroke, or more than one entry: not an arrowhead
+            scissor = clip["scissor"]
+            if {item[0] for item in clip["items"]} != {"l"} or max(scissor.width, scissor.height) > ALIGN_HEAD_MAX_LEN:
+                continue
+            area = clip_polygon(clip["items"])
+            if not isinstance(area, Polygon):
+                continue  # several separate shapes
+            polys.append(area)
+            head_path.append(seq_to_path[clipped["seqno"]])
+            head_color.append(clipped["fill"])
+        self.head_polys = np.array(polys)
+        self.head_path = np.array(head_path, dtype=int)
+        self.head_color = head_color
+        rects = shapely.minimum_rotated_rectangle(self.head_polys)
+        corners = np.array([np.array(r.exterior.coords)[:3] for r in rects]).reshape(-1, 3, 2)
+        sides = np.diff(corners, axis=1)  # (n, 2, 2): two adjacent sides
+        lens = np.linalg.norm(sides, axis=2)
+        self.head_len = lens.max(axis=1)
+        self.head_width = lens.min(axis=1)
+        self.head_tree = STRtree(self.head_polys)
+
+    def _align_arrowhead(self, xy: np.ndarray, out: np.ndarray, leg: int, color: tuple) -> int | str:
+        """The one arrowhead at a leg's far end xy, pointing along unit vector out (away from
+        the crossbar): index into head_polys, or a failure reason.
+
+        It lies within JOIN_TOL of xy, has fill color `color`, its min rotated rectangle is at
+        most ALIGN_HEAD_MAX_LEN long and ALIGN_HEAD_MIN_ASPECT times as long as wide, and its
+        tip (the vertex farthest from xy) lies beyond xy in the leg's direction (ANGLE_TOL).
+        (The min rotated rectangle of a thin triangle follows one of its slanted sides, so its
+        direction is not the arrowhead's axis.)
+        """
+        cand = self.head_tree.query(shapely.points(xy), predicate="dwithin", distance=JOIN_TOL)
+        tips = np.zeros((len(cand), 2))
+        for n, h in enumerate(cand):
+            pts = shapely.get_coordinates(self.head_polys[h].exterior)
+            tips[n] = pts[np.linalg.norm(pts - xy, axis=1).argmax()]
+        to_tip = tips - xy
+        tip_angle = np.degrees(np.arctan2(to_tip[:, 1], to_tip[:, 0]))
+        ok = (
+            (to_tip @ out > 0)
+            & (angle_diff(tip_angle, self.seg_angle[leg]) <= ANGLE_TOL)
+            & (self.head_len[cand] <= ALIGN_HEAD_MAX_LEN)
+            & (self.head_len[cand] >= ALIGN_HEAD_MIN_ASPECT * self.head_width[cand])
+            & np.array([np.allclose(self.head_color[h], color) for h in cand], dtype=bool)
+        )
+        if ok.sum() != 1:
+            return f"{ok.sum()} arrowheads at a leg end"
+        return int(cand[ok][0])
+
+    def _align_bracket(self, bar: int, center: np.ndarray) -> tuple[list[int], list[int]] | str:
+        """Legs and arrowheads of the ALIGN bracket with crossbar segment bar, whose text is
+        centered at center: (segments [bar, leg, leg], arrowheads [h, h]), or a failure reason.
+
+        At each crossbar end exactly one leg: a segment with an end within JOIN_TOL, perpendicular
+        (ANGLE_TOL), at most ALIGN_LEG_MAX_LEN long, with the crossbar's stroke width and color,
+        running away from the text. Each leg's far end has one arrowhead (_align_arrowhead).
+        """
+        path = self.paths[self.seg_path[bar]]
+        xy = self.seg_xy[bar]
+        d = xy[1] - xy[0]
+        normal = np.array([-d[1], d[0]]) / np.linalg.norm(d)
+        away = -np.sign((center - xy[0]) @ normal) * normal  # from the crossbar, away from the text
+        legs, heads = [], []
+        for end in xy:
+            near = self.seg_tree.query(shapely.points(end), predicate="dwithin", distance=JOIN_TOL)
+            near = near[(near != bar) & (self.seg_kind[near] == "l")]
+            gaps = np.linalg.norm(self.seg_xy[near] - end, axis=2)  # (m, 2)
+            far = self.seg_xy[near, gaps.argmax(axis=1)]
+            ok = (
+                (gaps.min(axis=1) <= JOIN_TOL)
+                & (np.abs(angle_diff(self.seg_angle[near], self.seg_angle[bar]) - 90) <= ANGLE_TOL)
+                & (self.seg_len[near] <= ALIGN_LEG_MAX_LEN)
+                & np.isclose(self.seg_width[near], path["width"])
+                & np.array(
+                    [np.allclose(self.paths[p]["color"], path["color"]) for p in self.seg_path[near]], dtype=bool
+                )
+                & ((far - end) @ away > 0)
+            )
+            if ok.sum() != 1:
+                return f"{ok.sum()} legs at a crossbar end"
+            leg, tip = int(near[ok][0]), far[ok][0]
+            head = self._align_arrowhead(tip, away, leg, path["color"])
+            if isinstance(head, str):
+                return head
+            legs.append(leg)
+            heads.append(head)
+        if heads[0] == heads[1]:
+            return "both legs end on the same arrowhead"
+        return [bar] + legs, heads
+
+    def get_align_markers(self) -> None:
+        """Group each ALIGN marker: the text ALIGN_TEXT, its bracket and both arrowheads.
+
+        The crossbar is a straight segment parallel to the text (ANGLE_TOL), within
+        ALIGN_TEXT_MAX_GAP of its bbox, with the text center projecting inside it. Legs and
+        arrowheads are found by _align_bracket; exactly one crossbar candidate must have them.
+        There is no text mask. Sets self.align_markers, a list of {text, rect, items} (items:
+        sorted indices into self.paths; rect: [x0, y0, x1, y1], page space, pt), and
+        self.unclassified_align_markers, a list of {text, bbox (the text's), reason}. Uses only
+        self.paths and the text, so it does not need parse().
+        """
+        self._index_segments()
+        self._index_arrowheads()
+        self.align_markers, self.unclassified_align_markers = [], []
+        claimed: dict[int, str] = {}  # path index -> bbox of the marker text that owns it
+        used_heads: set[int] = set()
+        texts = np.flatnonzero(self.word_texts == ALIGN_TEXT)
+        for k in texts:
+            text, bbox = str(self.word_texts[k]), self.word_bboxes[k]
+            unclassified = {"text": text, "bbox": [round(float(v), 3) for v in bbox.bounds]}
+            center = shapely.get_coordinates(shapely.centroid(bbox))[0]
+            cand = self.seg_tree.query(bbox, predicate="dwithin", distance=ALIGN_TEXT_MAX_GAP)
+            cand = cand[
+                (self.seg_kind[cand] == "l") & (angle_diff(self.seg_angle[cand], self.word_angles[k]) <= ANGLE_TOL)
+            ]
+            t = shapely.line_locate_point(self.seg_geoms[cand], shapely.points(center), normalized=True)
+            cand = cand[(t > 0) & (t < 1)]
+            found = [b for b in (self._align_bracket(int(c), center) for c in cand) if not isinstance(b, str)]
+            if len(found) != 1:
+                reason = "no bracket" if not found else f"{len(found)} brackets"
+                self.unclassified_align_markers.append({**unclassified, "reason": reason})
+                continue
+            segs, heads = found[0]
+            paths, partial = self._group_paths(np.array(segs))
+            if partial:
+                reason = f"paths {partial} have items outside the group"
+                self.unclassified_align_markers.append({**unclassified, "reason": reason})
+                continue
+            items = sorted(set(paths + self.head_path[heads].tolist()))
+            taken = sorted({claimed[p] for p in items if p in claimed})
+            if taken:
+                reason = f"paths already used by markers at {taken}"
+                self.unclassified_align_markers.append({**unclassified, "reason": reason})
+                continue
+            claimed.update({p: str(unclassified["bbox"]) for p in items})
+            used_heads.update(heads)
+            rect = union_rect([bbox.bounds] + [self.paths[p]["rect"] for p in items])
+            self.align_markers.append({"text": text, "rect": rect, "items": items})
+        shaped = np.flatnonzero(
+            (self.head_len <= ALIGN_HEAD_MAX_LEN) & (self.head_len >= ALIGN_HEAD_MIN_ASPECT * self.head_width)
+        )
+        print(
+            f"align markers: {len(texts)} {ALIGN_TEXT!r} texts, {len(self.align_markers)} grouped, "
+            f"{len(self.unclassified_align_markers)} unclassified; "
+            f"{len(set(shaped.tolist()) - used_heads)} of {len(shaped)} arrowhead-shaped clipped fills not in a marker"
+        )
+
     def draw(self, out_dir: Path) -> None:
         debug_dir = out_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -646,31 +849,39 @@ class FloorPlanParser:
             raise RuntimeError("call get_measurements() before draw()")
         if not hasattr(self, "tags"):
             raise RuntimeError("call get_tags() before draw()")
+        if not hasattr(self, "align_markers"):
+            raise RuntimeError("call get_align_markers() before draw()")
         grid = [style_key(path) == self.grid_key for path in self.paths]
         meas = {i for group in self.measurements for i in group["items"]}
         tags = {i for group in self.tags for i in group["items"]}
-        drop = [g or i in meas or i in tags for i, g in enumerate(grid)]
+        align = {i for group in self.align_markers for i in group["items"]}
+        drop = [g or i in meas or i in tags or i in align for i, g in enumerate(grid)]
         remove_items(out[0], self.paths, drop, drop_text=True)
         out[0].set_cropbox(pymupdf.Rect(self.drawing_area.bounds))
         out.save(out_dir / "drawing.pdf", garbage=3, deflate=True)
         print(f"{out_dir}: removed all text, {sum(grid)} grid line paths, {len(self.measurements)} "
-              f"measurement groups ({len(meas)} paths), and {len(self.tags)} tags ({len(tags)} paths), "
+              f"measurement groups ({len(meas)} paths), {len(self.tags)} tags ({len(tags)} paths), and "
+              f"{len(self.align_markers)} ALIGN markers ({len(align)} paths), "
               f"cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
         self.write_unclassified(out_dir / "unclassified.yaml")
         # TODO@Claude Remove the remaining annotations as whole groups: title block, legend, enclosing
-        # labels, callouts, ALIGN markers. (All text, grid lines, measurements and tags are done.)
+        # labels, callouts. (All text, grid lines, measurements, tags and ALIGN markers are done.)
         # Delete specific drawing items; never redact a bbox. Unclassifiable items stay (unclassified.yaml).
         # Save the remaining primitive geoms in self.prim (label geometry stays in self.enc_labels).
 
 
     def write_unclassified(self, path: Path) -> None:
-        """Write the measurement texts and tags that could not be grouped (left in the drawing) as YAML."""
+        """Write the measurement texts, tags and ALIGN markers that could not be grouped (left in the
+        drawing) as YAML."""
         items = [
             {"kind": "measurement_text", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_measurements
         ] + [
             {"kind": "tag", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_tags
+        ] + [
+            {"kind": "align_marker", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
+            for u in self.unclassified_align_markers
         ]
         doc = {
             "source": self.page.parent.name,

@@ -1,13 +1,14 @@
-"""Build the measurement or tag fixtures: small crop PDFs of A-1-03-10 and candidate expected groups.
+"""Build the measurement, tag or ALIGN marker fixtures: small crop PDFs of A-1-03-10 and candidate
+expected groups.
 
 Usage, from the repo root:
-    python -m tests.make_fixtures --kind {measurements,tags} --review-dir DIR
+    python -m tests.make_fixtures --kind {measurements,tags,align} --review-dir DIR
 
 Writes tests/fixtures/<crop>.pdf, tests/expected/<crop>/<kind>.json, and DIR/<crop>.png
 with the candidate groups overlaid (one color per group, rect dashed, leader_rect dotted).
-The JSON files are candidates: they are produced by get_measurements() or get_tags() itself
-and become expected outputs only after a human has reviewed the PNGs. Rerunning overwrites
-the crops of that kind only.
+The JSON files are candidates: they are produced by get_measurements(), get_tags() or
+get_align_markers() itself and become expected outputs only after a human has reviewed the PNGs.
+Rerunning overwrites the crops of that kind only.
 
 A crop keeps only the drawing items whose rect (inflated by half the stroke width) meets its
 region, then sets the mediabox to the region, so crop coordinates are page coordinates
@@ -58,6 +59,18 @@ TAG_CROPS = {
         ("J31", (687.5, 879.4)),
     ],  # parallel diamond edges 0.4 pt apart
 }
+# Crop stem -> ALIGN markers the crop must contain, each as (text, a point inside its rect on the page, pt).
+ALIGN_CROPS = {
+    "align_horizontal": [("ALIGN", (1789.0, 1830.0))],  # text below, arrowheads point up
+    "align_vertical": [("ALIGN", (1367.0, 1935.0))],  # text read upward, arrowheads point right
+    "align_diagonal": [("ALIGN", (730.0, 1085.0))],  # 45 deg, arrowhead clips with stair-step slivers
+    "align_skewed": [("ALIGN", (2218.0, 1955.0))],  # about 22 deg
+    "align_side_by_side": [
+        ("ALIGN", (965.0, 1608.0)),
+        ("ALIGN", (1009.0, 1608.0)),
+    ],  # two markers next to each other
+    "align_long": [("ALIGN", (1944.0, 1597.0))],  # 148 pt crossbar
+}
 COLORS = [
     (0.9, 0, 0),
     (0, 0.6, 0),
@@ -84,14 +97,14 @@ def select_measurements(groups: list[dict], texts: list[str]) -> list[dict]:
 def select_tags(
     groups: list[dict], picks: list[tuple[str, tuple[float, float]]]
 ) -> list[dict]:
-    """The one tag per (text, point) whose rect contains the point."""
+    """The one tag or ALIGN marker per (text, point) whose rect contains the point."""
     selected = []
     for text, point in picks:
         matches = [
             g for g in groups if g["text"] == text and pymupdf.Point(point) in pymupdf.Rect(g["rect"])
         ]
         if len(matches) != 1:
-            raise ValueError(f"{text!r} at {point} has {len(matches)} tags on the page, expected 1")
+            raise ValueError(f"{text!r} at {point} has {len(matches)} groups on the page, expected 1")
         selected.append(matches[0])
     return selected
 
@@ -216,7 +229,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--kind", choices=["measurements", "tags"], required=True)
+    parser.add_argument("--kind", choices=["measurements", "tags", "align"], required=True)
     parser.add_argument("--review-dir", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -225,14 +238,17 @@ def main(argv: list[str] | None = None) -> None:
         if args.kind == "measurements":
             fp.get_measurements()
             return fp.measurements, fp.unclassified_measurements
-        fp.get_tags()
-        return fp.tags, fp.unclassified_tags
+        if args.kind == "tags":
+            fp.get_tags()
+            return fp.tags, fp.unclassified_tags
+        fp.get_align_markers()
+        return fp.align_markers, fp.unclassified_align_markers
 
     source = pymupdf.open(SOURCE)
     full_groups, _ = groups_of(FloorPlanParser(source[0]))
     FIXTURES.mkdir(parents=True, exist_ok=True)
     args.review_dir.mkdir(parents=True, exist_ok=True)
-    crops = CROPS if args.kind == "measurements" else TAG_CROPS
+    crops = {"measurements": CROPS, "tags": TAG_CROPS, "align": ALIGN_CROPS}[args.kind]
     for stem, picks in crops.items():
         if args.kind == "measurements":
             selected = select_measurements(full_groups, picks)
