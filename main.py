@@ -38,6 +38,7 @@ def main() -> None:
             parser = FloorPlanParser(page)
             parser.parse()
             parser.get_measurements()
+            parser.get_tags()
             parser.draw(out_dir)
 
 

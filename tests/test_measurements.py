@@ -17,7 +17,7 @@ from data_eng.parser import FloorPlanParser
 FIXTURES = Path(__file__).parent / "fixtures"
 EXPECTED = Path(__file__).parent / "expected"
 MIN_IOU = 0.95
-CROPS = sorted(p.stem for p in FIXTURES.glob("*.pdf"))
+CROPS = sorted(p.parent.name for p in EXPECTED.glob("*/measurements.json"))
 
 
 def iou(a: list[float], b: list[float]) -> float:

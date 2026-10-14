@@ -1,12 +1,13 @@
-"""Build the measurement fixtures: small crop PDFs of A-1-03-10 and candidate expected groups.
+"""Build the measurement or tag fixtures: small crop PDFs of A-1-03-10 and candidate expected groups.
 
 Usage, from the repo root:
-    python -m tests.make_fixtures --review-dir DIR
+    python -m tests.make_fixtures --kind {measurements,tags} --review-dir DIR
 
-Writes tests/fixtures/<crop>.pdf, tests/expected/<crop>/measurements.json, and DIR/<crop>.png
+Writes tests/fixtures/<crop>.pdf, tests/expected/<crop>/<kind>.json, and DIR/<crop>.png
 with the candidate groups overlaid (one color per group, rect dashed, leader_rect dotted).
-The JSON files are candidates: they are produced by get_measurements() itself and become
-expected outputs only after a human has reviewed the PNGs. Rerunning overwrites them.
+The JSON files are candidates: they are produced by get_measurements() or get_tags() itself
+and become expected outputs only after a human has reviewed the PNGs. Rerunning overwrites
+the crops of that kind only.
 
 A crop keeps only the drawing items whose rect (inflated by half the stroke width) meets its
 region, then sets the mediabox to the region, so crop coordinates are page coordinates
@@ -43,6 +44,20 @@ CROPS = {
         "2950 mm"
     ],  # dimension line along a wall face, wall edges at both ends
 }
+# Crop stem -> tags the crop must contain, each as (text, a point inside its rect on the page, pt).
+# Tag texts repeat across the page, so the point picks the tag.
+TAG_CROPS = {
+    "tag_bent_f23": [("F23", (841.0, 330.0))],  # two-piece leader, bar on a wall next to grid lines
+    "tag_straight_g03": [("G03", (1445.0, 1850.0))],  # one-piece leader
+    "tag_stacked_j02": [
+        ("J02", (1739.6, 1794.7)),
+        ("F21", (1752.0, 1775.0)),
+    ],  # J02 drawn twice (two leaders), touching F21
+    "tag_touching_g03_j31": [
+        ("G03", (699.6, 867.9)),
+        ("J31", (687.5, 879.4)),
+    ],  # parallel diamond edges 0.4 pt apart
+}
 COLORS = [
     (0.9, 0, 0),
     (0, 0.6, 0),
@@ -53,18 +68,41 @@ COLORS = [
 ]
 
 
-def crop_region(groups: list[dict], texts: list[str]) -> pymupdf.Rect:
-    """Union of the rects of the groups with these texts, plus CROP_MARGIN (page space, pt)."""
-    region = pymupdf.Rect()
+def select_measurements(groups: list[dict], texts: list[str]) -> list[dict]:
+    """The one measurement group per text."""
+    selected = []
     for text in texts:
         matches = [g for g in groups if g["text"] == text]
         if len(matches) != 1:
             raise ValueError(
                 f"{text!r} has {len(matches)} measurement groups on the page, expected 1"
             )
-        region |= pymupdf.Rect(matches[0]["rect"])
-        if matches[0]["leader_rect"] is not None:
-            region |= pymupdf.Rect(matches[0]["leader_rect"])
+        selected.append(matches[0])
+    return selected
+
+
+def select_tags(
+    groups: list[dict], picks: list[tuple[str, tuple[float, float]]]
+) -> list[dict]:
+    """The one tag per (text, point) whose rect contains the point."""
+    selected = []
+    for text, point in picks:
+        matches = [
+            g for g in groups if g["text"] == text and pymupdf.Point(point) in pymupdf.Rect(g["rect"])
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"{text!r} at {point} has {len(matches)} tags on the page, expected 1")
+        selected.append(matches[0])
+    return selected
+
+
+def crop_region(groups: list[dict]) -> pymupdf.Rect:
+    """Union of the groups' rects (and leader_rects), plus CROP_MARGIN (page space, pt)."""
+    region = pymupdf.Rect()
+    for group in groups:
+        region |= pymupdf.Rect(group["rect"])
+        if group.get("leader_rect") is not None:
+            region |= pymupdf.Rect(group["leader_rect"])
     return region + (-CROP_MARGIN, -CROP_MARGIN, CROP_MARGIN, CROP_MARGIN)
 
 
@@ -129,16 +167,14 @@ def make_crop(
     return doc, kept
 
 
-def check_same_groups(
-    texts: list[str], page_groups: list[dict], crop_groups: list[dict], kept: list[int]
-) -> None:
-    """Raise if a crop's groups for texts, mapped to page indices, differ from the page's."""
-    for text in texts:
-        want = [g["items"] for g in page_groups if g["text"] == text]
-        got = [[kept[i] for i in g["items"]] for g in crop_groups if g["text"] == text]
-        if got != want:
+def check_same_groups(selected: list[dict], crop_groups: list[dict], kept: list[int]) -> None:
+    """Raise unless each selected page group is exactly one crop group (mapped to page indices)."""
+    mapped = [[kept[i] for i in g["items"]] for g in crop_groups]
+    for group in selected:
+        if mapped.count(group["items"]) != 1:
+            same_text = [m for m, g in zip(mapped, crop_groups) if g["text"] == group["text"]]
             raise RuntimeError(
-                f"{text!r}: crop groups {got} differ from page groups {want}"
+                f"{group['text']!r}: crop groups {same_text} differ from page group {group['items']}"
             )
 
 
@@ -165,7 +201,7 @@ def draw_review(pdf: Path, groups: list[dict], out: Path) -> None:
             shape.finish(color=color, width=0.8)
         shape.draw_rect(pymupdf.Rect(group["rect"]))
         shape.finish(color=color, width=0.4, dashes="[2 1] 0")
-        if group["leader_rect"] is not None:
+        if group.get("leader_rect") is not None:
             shape.draw_rect(pymupdf.Rect(group["leader_rect"]))
             shape.finish(color=color, width=0.4, dashes="[0.4 0.8] 0")
         x0, y0 = group["rect"][:2]
@@ -180,33 +216,44 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--kind", choices=["measurements", "tags"], required=True)
     parser.add_argument("--review-dir", type=Path, required=True)
     args = parser.parse_args(argv)
 
+    def groups_of(fp: FloorPlanParser) -> tuple[list[dict], list[dict]]:
+        """(groups, unclassified) of fp for args.kind."""
+        if args.kind == "measurements":
+            fp.get_measurements()
+            return fp.measurements, fp.unclassified_measurements
+        fp.get_tags()
+        return fp.tags, fp.unclassified_tags
+
     source = pymupdf.open(SOURCE)
-    full = FloorPlanParser(source[0])
-    full.get_measurements()
+    full_groups, _ = groups_of(FloorPlanParser(source[0]))
     FIXTURES.mkdir(parents=True, exist_ok=True)
     args.review_dir.mkdir(parents=True, exist_ok=True)
-    for stem, texts in CROPS.items():
-        region = crop_region(full.measurements, texts)
+    crops = CROPS if args.kind == "measurements" else TAG_CROPS
+    for stem, picks in crops.items():
+        if args.kind == "measurements":
+            selected = select_measurements(full_groups, picks)
+        else:
+            selected = select_tags(full_groups, picks)
+        region = crop_region(selected)
         pdf = FIXTURES / f"{stem}.pdf"
         doc, kept = make_crop(source, region)
         doc.save(pdf, garbage=3, deflate=True)
 
         crop = FloorPlanParser(pymupdf.open(pdf)[0])
-        crop.get_measurements()
-        check_same_groups(texts, full.measurements, crop.measurements, kept)
+        groups, unclassified = groups_of(crop)
+        check_same_groups(selected, groups, kept)
         out = EXPECTED / stem
         out.mkdir(parents=True, exist_ok=True)
-        (out / "measurements.json").write_text(
-            json.dumps(crop.measurements, indent=1) + "\n"
-        )
-        draw_review(pdf, crop.measurements, args.review_dir / f"{stem}.png")
+        (out / f"{args.kind}.json").write_text(json.dumps(groups, indent=1) + "\n")
+        draw_review(pdf, groups, args.review_dir / f"{stem}.png")
         print(
             f"{stem}: region {tuple(round(v, 2) for v in region)}, {len(crop.paths)} drawing items, "
-            f"{pdf.stat().st_size // 1024} KiB, groups {[g['text'] for g in crop.measurements]}, "
-            f"unclassified {crop.unclassified_measurements}"
+            f"{pdf.stat().st_size // 1024} KiB, groups {[g['text'] for g in groups]}, "
+            f"unclassified {unclassified}"
         )
 
 

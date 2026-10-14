@@ -34,6 +34,13 @@ LEADER_MAX_TURN = 60.0  # degrees; max change of direction from one leader piece
 MASK_MIN_COVER = 0.9  # fraction of the text bbox area a mask covers; masks cover 0.97-0.99
 MASK_MAX_AREA_RATIO = 1.75  # mask area / text bbox area; masks are 1.12-1.49
 
+# Tag grouping. Ranges in comments were measured in A-1-03-10.
+TAG_EDGE_TOL = 0.05  # pt; diamond corners come from edge ends rounded to 0.01 pt; touching tags are 0.4 apart
+TAG_MASK_TOL = 0.5  # pt; max difference between a mask's bounds and its diamond's bbox (0.10-0.15)
+TAG_BAR_MAX_LEN = 10.0  # pt; end bars are 5.6-5.8 pt long
+TAG_LEADER_MAX_TURN = 100.0  # degrees; tag leaders bend by 45-90 (85 < max <= 90)
+TAG_BAR_MIN_WIDTH_RATIO = 3.0  # end bar stroke width / leader stroke width; 1.92 / 0.36 = 5.3
+
 
 def style_key(path: dict) -> tuple | None:
     """(color, width) of a get_drawings() path, rounded to 4 decimals; None if either is None."""
@@ -164,10 +171,11 @@ class FloorPlanParser:
     def _index_segments(self) -> None:
         """One straight segment per l item (and per c item, as its chord) of every stroked path.
 
-        Sets seg_geoms, seg_path (index into self.paths), seg_xy (n, 2, 2), seg_angle (degrees,
-        page space), seg_len (pt), seg_tree, and path_segs (path index -> its segment indices).
+        Sets seg_geoms, seg_path (index into self.paths), seg_width (stroke width, pt), seg_kind
+        ("l" or "c"), seg_xy (n, 2, 2), seg_angle (degrees, page space), seg_len (pt), seg_tree,
+        and path_segs (path index -> its segment indices).
         """
-        geoms, seg_path, n_items = [], [], []
+        geoms, seg_path, seg_width, seg_kind, n_items = [], [], [], [], []
         for i, path in enumerate(self.paths):
             n_items.append(len(path["items"]))
             if "s" not in path["type"]:
@@ -184,8 +192,12 @@ class FloorPlanParser:
                     raise ValueError("unhandled drawing", item)
                 geoms.append(LineString([tuple(pts[0]), tuple(pts[1])]))
                 seg_path.append(i)
+                seg_width.append(path["width"])
+                seg_kind.append(kind)
         self.seg_geoms = np.array(geoms)
         self.seg_path = np.array(seg_path, dtype=int)
+        self.seg_width = np.array(seg_width, dtype=float)
+        self.seg_kind = np.array(seg_kind)
         self.seg_xy = shapely.get_coordinates(self.seg_geoms).reshape(-1, 2, 2)
         d = self.seg_xy[:, 1] - self.seg_xy[:, 0]
         self.seg_angle = np.degrees(np.arctan2(d[:, 1], d[:, 0]))
@@ -316,16 +328,25 @@ class FloorPlanParser:
             return "dim", hits[0]
         if hits:
             return "fail", -1
+        nxt = self._next_piece(xy, heading, near)
+        if nxt is not None:
+            return "next", nxt
+        return "fail", -1
+
+    def _next_piece(
+        self, xy: np.ndarray, heading: float, near: np.ndarray, max_turn: float = LEADER_MAX_TURN
+    ) -> int | None:
+        """The one segment of near with an end within JOIN_TOL of xy that turns at most max_turn
+        from heading (degrees, direction the leader arrived in); None if not exactly one.
+        """
         gaps = np.linalg.norm(self.seg_xy[near] - xy, axis=2)  # (m, 2)
         joined = gaps.min(axis=1) <= JOIN_TOL
         near, gaps = near[joined], gaps[joined]
         other = self.seg_xy[near, gaps.argmax(axis=1)]
         out = np.degrees(np.arctan2(other[:, 1] - xy[1], other[:, 0] - xy[0]))
         turn = np.abs((out - heading + 180) % 360 - 180)
-        nxt = near[turn <= LEADER_MAX_TURN]
-        if len(nxt) == 1:
-            return "next", int(nxt[0])
-        return "fail", -1
+        nxt = near[turn <= max_turn]
+        return int(nxt[0]) if len(nxt) == 1 else None
 
     def _find_leader(self, k: int) -> tuple[list[int], int] | str:
         """Leader from text k to a dimension line: (leader segments, line), or a failure reason.
@@ -456,6 +477,162 @@ class FloorPlanParser:
             f"{n_leader} with a leader, {len(self.unclassified_measurements)} unclassified"
         )
 
+    def _tag_bars(self, xy: np.ndarray, prev: np.ndarray, last: int) -> np.ndarray:
+        """End bar candidates at a tag leader's free end xy; the last piece (segment last) runs
+        from prev to xy.
+
+        A bar has one end within JOIN_TOL of xy and runs back along the leader (it may pass the
+        leader's last bend), is parallel to the last piece (ANGLE_TOL), at most TAG_BAR_MAX_LEN
+        long, and at least TAG_BAR_MIN_WIDTH_RATIO times as wide.
+        """
+        near = self.seg_tree.query(shapely.points(xy), predicate="dwithin", distance=JOIN_TOL)
+        near = near[near != last]
+        gaps = np.linalg.norm(self.seg_xy[near] - xy, axis=2)  # (m, 2)
+        other = self.seg_xy[near, gaps.argmax(axis=1)]
+        ok = (
+            (gaps.min(axis=1) <= JOIN_TOL)
+            & ((other - xy) @ (prev - xy) > 0)
+            & (angle_diff(self.seg_angle[near], self.seg_angle[last]) <= ANGLE_TOL)
+            & (self.seg_len[near] <= TAG_BAR_MAX_LEN)
+            & (self.seg_width[near] >= TAG_BAR_MIN_WIDTH_RATIO * self.seg_width[last])
+        )
+        return near[ok]
+
+    def _find_tag_leaders(
+        self, diamond: Polygon, edges: np.ndarray, all_edges: np.ndarray, copies: int
+    ) -> list[tuple[list[int], int]] | str:
+        """Leaders from a diamond's corners to their end bars: [(leader segments, bar)], or a
+        failure reason.
+
+        edges are the diamond's segments, all_edges those of every diamond (tags can touch at
+        their corners). A diamond drawn `copies` times has one leader per copy: exactly that many
+        other segments with the stroke width of the diamond's edges must start within JOIN_TOL of
+        a corner. Pieces of that width are followed with _next_piece (TAG_LEADER_MAX_TURN) until
+        a free end has exactly one end bar (_tag_bars).
+        """
+        corners = np.array(diamond.exterior.coords[:4])
+        ci, si = self.seg_tree.query(shapely.points(corners), predicate="dwithin", distance=JOIN_TOL)
+        ok = ~np.isin(si, all_edges) & np.isin(self.seg_width[si], self.seg_width[edges])
+        ci, si = ci[ok], si[ok]
+        gaps = np.linalg.norm(self.seg_xy[si] - corners[ci][:, None], axis=2)  # (m, 2)
+        starts = np.flatnonzero(gaps.min(axis=1) <= JOIN_TOL)
+        if len(starts) != copies or len(np.unique(si[starts])) != copies:
+            return f"{len(np.unique(si[starts]))} leader starts at the corners for {copies} copies"
+        found = []
+        for s, corner in zip(si[starts].tolist(), corners[ci[starts]]):
+            ends = self.seg_xy[s]
+            far = int(np.argmax(np.linalg.norm(ends - corner, axis=1)))
+            prev, free = ends[1 - far], ends[far]
+            chain = [s]
+            for _ in range(LEADER_MAX_SEGS):
+                bars = self._tag_bars(free, prev, chain[-1])
+                bars = bars[~np.isin(bars, chain)]
+                if len(bars) == 1:
+                    found.append((chain, int(bars[0])))
+                    break
+                if len(bars) > 1:
+                    return f"{len(bars)} end bars"
+                heading = math.degrees(math.atan2(free[1] - prev[1], free[0] - prev[0]))
+                near = self.seg_tree.query(shapely.points(free), predicate="dwithin", distance=JOIN_TOL)
+                near = near[~np.isin(near, np.concatenate([chain, all_edges]))]
+                near = near[self.seg_width[near] == self.seg_width[s]]
+                j = self._next_piece(free, heading, near, TAG_LEADER_MAX_TURN)
+                if j is None:
+                    return "leader ends without an end bar"
+                chain.append(j)
+                ends = self.seg_xy[j]
+                far = int(np.argmax(np.linalg.norm(ends - free, axis=1)))
+                prev, free = free, ends[far]
+            else:
+                return f"no end bar within {LEADER_MAX_SEGS} leader pieces"
+        return found
+
+    def get_tags(self) -> None:
+        """Group each tag: diamond, the code inside it, its mask, leader and end bar.
+
+        A diamond is a square of straight stroked segments at 45 deg to the axes (within
+        ANGLE_TOL) around the center of one text line, or of identical text lines drawn on top
+        of each other (a tag drawn several times, one leader per copy). It has one mask per copy:
+        a fill whose bounds match the diamond's bbox within TAG_MASK_TOL. Leaders run from its
+        corners to end bars (_find_tag_leaders). Sets self.tags, a list of {text, rect, items}
+        (items: sorted indices into self.paths; rect: [x0, y0, x1, y1], page space, pt), and
+        self.unclassified_tags, a list of {text, bbox (the diamond's), reason}. Uses only
+        self.paths and the text, so it does not need parse().
+        """
+        self._index_segments()
+        self._index_masks()
+        diag = np.flatnonzero(
+            (np.abs(angle_diff(self.seg_angle, 0) - 45) <= ANGLE_TOL) & (self.seg_kind == "l")
+        )
+        rects, _ = find_rectangles(self.seg_geoms[diag])
+        rects = np.array(rects, dtype=object)
+        sides = np.array([np.linalg.norm(np.diff(r.exterior.coords[:3], axis=0), axis=1) for r in rects])
+        squares = rects[np.abs(sides[:, 0] - sides[:, 1]) <= JOIN_TOL] if len(rects) else rects
+        sq, wi = STRtree(shapely.centroid(self.word_bboxes)).query(squares, predicate="contains")
+        texts_in = defaultdict(list)  # square -> text lines with their center inside it
+        for q, k in zip(sq.tolist(), wi.tolist()):
+            texts_in[q].append(k)
+        by_text = defaultdict(list)  # first of identical stacked text lines -> squares around them
+        for q, ks in texts_in.items():
+            b = shapely.bounds(self.word_bboxes[ks])
+            if len(set(self.word_texts[ks])) == 1 and np.abs(b - b[0]).max() <= TAG_EDGE_TOL:
+                by_text[min(ks)].append(q)
+        diamond_edges = {}  # square -> its segments
+        for q in sorted({q for qs in by_text.values() for q in qs}):
+            edges = self.seg_tree.query(squares[q].exterior.buffer(TAG_EDGE_TOL), predicate="contains")
+            diamond_edges[q] = edges[np.isin(edges, diag)]
+        all_edges = np.concatenate([np.zeros(0, dtype=int), *diamond_edges.values()])
+
+        self.tags, self.unclassified_tags = [], []
+        claimed: dict[int, str] = {}  # path index -> text of the tag that owns it
+        n_pieces = defaultdict(int)  # leader pieces -> leaders
+        for k in sorted(by_text):
+            text = str(self.word_texts[k])
+            if len(by_text[k]) > 1:
+                bbox = union_rect([squares[q].bounds for q in by_text[k]])
+                reason = f"{len(by_text[k])} diamonds around the text"
+                self.unclassified_tags.append({"text": text, "bbox": bbox, "reason": reason})
+                continue
+            q = by_text[k][0]
+            diamond, edges, copies = squares[q], diamond_edges[q], len(texts_in[q])
+            unclassified = {"text": text, "bbox": [round(float(v), 3) for v in diamond.bounds]}
+            mask_cand = self.mask_tree.query(diamond, predicate="intersects")
+            off = np.abs(shapely.bounds(self.mask_polys[mask_cand]) - np.array(diamond.bounds))
+            masks = self.mask_path[mask_cand[off.max(axis=1) <= TAG_MASK_TOL]] if len(mask_cand) else []
+            if len(masks) != copies:
+                reason = f"{len(masks)} candidate masks for {copies} copies"
+                self.unclassified_tags.append({**unclassified, "reason": reason})
+                continue
+            found = self._find_tag_leaders(diamond, edges, all_edges, copies)
+            if isinstance(found, str):
+                self.unclassified_tags.append({**unclassified, "reason": found})
+                continue
+            segs = np.concatenate([edges] + [chain + [bar] for chain, bar in found])
+            paths, partial = self._group_paths(segs)
+            if partial:
+                reason = f"paths {partial} have items outside the group"
+                self.unclassified_tags.append({**unclassified, "reason": reason})
+                continue
+            items = sorted(set(paths + masks.tolist()))
+            taken = sorted({claimed[p] for p in items if p in claimed})
+            if taken:
+                reason = f"paths already used by tags {taken}"
+                self.unclassified_tags.append({**unclassified, "reason": reason})
+                continue
+            claimed.update({p: text for p in items})
+            for chain, _ in found:
+                n_pieces[len(chain)] += 1
+            rect = union_rect([self.word_bboxes[k].bounds] + [self.paths[p]["rect"] for p in items])
+            self.tags.append({"text": text, "rect": rect, "items": items})
+        widest = self.seg_width.max()
+        wide_paths = set(self.seg_path[np.isclose(self.seg_width, widest)].tolist())
+        print(
+            f"tags: {len(by_text)} diamonds with a text, {len(self.tags)} grouped "
+            f"(leader pieces -> leaders: {dict(sorted(n_pieces.items()))}), "
+            f"{len(self.unclassified_tags)} unclassified; widest strokes ({widest:.4g} pt): "
+            f"{len(wide_paths - set(claimed))} of {len(wide_paths)} paths not in a tag"
+        )
+
     def draw(self, out_dir: Path) -> None:
         debug_dir = out_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -467,26 +644,33 @@ class FloorPlanParser:
         out.insert_pdf(self.page.parent, from_page=self.page.number, to_page=self.page.number)
         if not hasattr(self, "measurements"):
             raise RuntimeError("call get_measurements() before draw()")
+        if not hasattr(self, "tags"):
+            raise RuntimeError("call get_tags() before draw()")
         grid = [style_key(path) == self.grid_key for path in self.paths]
         meas = {i for group in self.measurements for i in group["items"]}
-        drop = [g or i in meas for i, g in enumerate(grid)]
+        tags = {i for group in self.tags for i in group["items"]}
+        drop = [g or i in meas or i in tags for i, g in enumerate(grid)]
         remove_items(out[0], self.paths, drop, drop_text=True)
         out[0].set_cropbox(pymupdf.Rect(self.drawing_area.bounds))
         out.save(out_dir / "drawing.pdf", garbage=3, deflate=True)
-        print(f"{out_dir}: removed all text, {sum(grid)} grid line paths, and {len(self.measurements)} "
-              f"measurement groups ({len(meas)} paths), cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
+        print(f"{out_dir}: removed all text, {sum(grid)} grid line paths, {len(self.measurements)} "
+              f"measurement groups ({len(meas)} paths), and {len(self.tags)} tags ({len(tags)} paths), "
+              f"cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
         self.write_unclassified(out_dir / "unclassified.yaml")
         # TODO@Claude Remove the remaining annotations as whole groups: title block, legend, enclosing
-        # labels, callouts, tags, ALIGN markers. (All text, grid lines and measurements are done.)
+        # labels, callouts, ALIGN markers. (All text, grid lines, measurements and tags are done.)
         # Delete specific drawing items; never redact a bbox. Unclassifiable items stay (unclassified.yaml).
         # Save the remaining primitive geoms in self.prim (label geometry stays in self.enc_labels).
 
 
     def write_unclassified(self, path: Path) -> None:
-        """Write the measurement texts that could not be grouped (left in the drawing) as YAML."""
+        """Write the measurement texts and tags that could not be grouped (left in the drawing) as YAML."""
         items = [
             {"kind": "measurement_text", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_measurements
+        ] + [
+            {"kind": "tag", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
+            for u in self.unclassified_tags
         ]
         doc = {
             "source": self.page.parent.name,
