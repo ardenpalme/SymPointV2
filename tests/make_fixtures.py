@@ -1,13 +1,13 @@
-"""Build the measurement, tag, ALIGN marker, callout or room label fixtures: small crop PDFs of
-A-1-03-10 and candidate expected groups.
+"""Build the measurement, tag, ALIGN marker, callout, room label or oval tag fixtures: small crop
+PDFs of A-1-03-10 and candidate expected groups.
 
 Usage, from the repo root:
-    python -m tests.make_fixtures --kind {measurements,tags,align,callouts,rooms} --review-dir DIR
+    python -m tests.make_fixtures --kind {measurements,tags,align,callouts,rooms,ovals} --review-dir DIR
 
 Writes tests/fixtures/<crop>.pdf, tests/expected/<crop>/<kind>.json, and DIR/<crop>.png
 with the candidate groups overlaid (one color per group, rect dashed, leader_rect dotted, room
 label end dots circled). The JSON files are candidates: they are produced by get_measurements(),
-get_tags(), get_align_markers(), get_callouts() or get_room_labels() itself and become expected
+get_tags(), get_align_markers(), get_callouts(), get_room_labels() or get_oval_tags() itself and become expected
 outputs only after a human has reviewed the PNGs.
 Rerunning overwrites the crops of that kind only.
 
@@ -27,7 +27,7 @@ import pymupdf
 import shapely
 from shapely import Polygon, STRtree
 
-from data_eng.parser import JOIN_TOL, FloorPlanParser, room_label_json
+from data_eng.parser import JOIN_TOL, FloorPlanParser, oval_tag_json, room_label_json
 from data_eng.utils import remove_items
 
 SOURCE = Path("tmp_dataset/A-1-03-10 - LEVEL 03 - PARTITION PLAN.pdf")
@@ -90,6 +90,12 @@ ROOM_CROPS = {
     "room_no_leader_03-A55": [("03-A55", (1732.0, 1443.0))],  # one name line
     "room_leader_crosses_walls_03-C17": [("03-C17", (1532.0, 1097.0))],  # leader crosses 4 wall lines
 }
+# Crop stem -> oval tags the crop must contain, each as (number, a point inside its rect on the page, pt).
+OVAL_CROPS = {
+    "oval_bent_leader_110": [("110", (2168.0, 1628.0))],  # leader right, then down-right
+    "oval_bent_leader_111": [("111", (625.0, 1007.0))],  # leader right, then up-right, onto a hatched wall
+    "oval_window_110": [("110", (2017.0, 2025.0))],  # straight two-piece leader, arrowhead on a window
+}
 COLORS = [
     (0.9, 0, 0),
     (0, 0.6, 0),
@@ -114,14 +120,14 @@ def select_measurements(groups: list[dict], texts: list[str]) -> list[dict]:
 
 
 def rect_bounds(rect: list[float] | Polygon) -> pymupdf.Rect:
-    """A group's rect as a pymupdf.Rect: [x0, y0, x1, y1], or the bounds of a room label's Polygon."""
+    """A group's rect as a pymupdf.Rect: [x0, y0, x1, y1], or the bounds of a room label's or oval tag's Polygon."""
     return pymupdf.Rect(rect.bounds if isinstance(rect, Polygon) else rect)
 
 
 def select_tags(
     groups: list[dict], picks: list[tuple[str, tuple[float, float]]]
 ) -> list[dict]:
-    """The one tag, ALIGN marker, callout or room label per (text, point) whose rect contains the point."""
+    """The one tag, ALIGN marker, callout, room label or oval tag per (text, point) whose rect contains the point."""
     selected = []
     for text, point in picks:
         matches = [
@@ -139,7 +145,10 @@ def crop_region(groups: list[dict]) -> pymupdf.Rect:
     for group in groups:
         region |= rect_bounds(group["rect"])
         if group.get("leader_rect") is not None:
-            region |= pymupdf.Rect(group["leader_rect"])
+            # Corners, not the Rect: a straight leader along an axis has an empty rect, which | ignores.
+            x0, y0, x1, y1 = group["leader_rect"]
+            region |= pymupdf.Point(x0, y0)
+            region |= pymupdf.Point(x1, y1)
         if group.get("dot") is not None:
             region |= pymupdf.Point(group["dot"].x, group["dot"].y)
     return region + (-CROP_MARGIN, -CROP_MARGIN, CROP_MARGIN, CROP_MARGIN)
@@ -261,7 +270,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--kind", choices=["measurements", "tags", "align", "callouts", "rooms"], required=True)
+    parser.add_argument("--kind", choices=["measurements", "tags", "align", "callouts", "rooms", "ovals"], required=True)
     parser.add_argument("--review-dir", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -280,7 +289,10 @@ def main(argv: list[str] | None = None) -> None:
             fp.get_callouts()
             return fp.callouts, fp.unclassified_callouts
         fp.get_room_labels()
-        return fp.enc_labels, fp.unclassified_room_labels
+        if args.kind == "rooms":
+            return fp.enc_labels, fp.unclassified_room_labels
+        fp.get_oval_tags()
+        return [g for g in fp.enc_labels if g["kind"] == "oval_tag"], fp.unclassified_oval_tags
 
     source = pymupdf.open(SOURCE)
     full_groups, _ = groups_of(FloorPlanParser(source[0]))
@@ -292,6 +304,7 @@ def main(argv: list[str] | None = None) -> None:
         "align": ALIGN_CROPS,
         "callouts": CALLOUT_CROPS,
         "rooms": ROOM_CROPS,
+        "ovals": OVAL_CROPS,
     }[args.kind]
     for stem, picks in crops.items():
         if args.kind == "measurements":
@@ -310,6 +323,8 @@ def main(argv: list[str] | None = None) -> None:
         out.mkdir(parents=True, exist_ok=True)
         if args.kind == "rooms":
             (out / "room_labels.json").write_text(json.dumps([room_label_json(g) for g in groups], indent=1) + "\n")
+        elif args.kind == "ovals":
+            (out / "oval_tags.json").write_text(json.dumps([oval_tag_json(g) for g in groups], indent=1) + "\n")
         else:
             (out / f"{args.kind}.json").write_text(json.dumps(groups, indent=1) + "\n")
         draw_review(pdf, groups, args.review_dir / f"{stem}.png")

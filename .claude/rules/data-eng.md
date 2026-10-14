@@ -37,8 +37,9 @@ drawing area, then encodes the remaining primitives for the model.
 - `measurements.yaml` (endpoints, text as written, length in pt), `rooms.yaml` (text, position, bbox).
 - `<input-stem>_s2.npz`: primitives from `self.prim`, in the `parse_svg_v5.py` format (see Contracts in
   CLAUDE.md). `semanticIds` and `instanceIds` come from the boxes in `annotations/<pdf stem>.xml`.
-- Room label groups (`text`, `name`, `rect`, `leader_rect`, `dot`, `items`) and oval tag groups (`rect`,
-  `leader_rect`, `items`) are stored in `self.enc_labels`; they never go into `self.prim`.
+- Room label groups (`kind: room_label`, `text`, `name`, `rect`, `leader_rect`, `dot`, `items`) and oval
+  tag groups (`kind: oval_tag`, `text`, `rect`, `leader_rect`, `items`) are stored in `self.enc_labels`;
+  they never go into `self.prim`. Filter by `kind`.
 - YAML starts with `source`, `page`, `coordinate_space`, `units`. Debug renders go in `debug/`.
   No new files or fields without asking.
 
@@ -110,9 +111,12 @@ Facts:
   Exception: room names have no mask; the room number's box `re` is its mask.
 - Drawing order is only a weak hint: annotation strokes come late, fills (including ALIGN
   arrowheads) come early.
-- The oval of an oval tag is a convex polygon of many short line segments, some overlapping,
-  not curves. Overlapping segments break linemerge and polygonize, so detect the oval as the
-  cluster of segments around the number, or by its convex hull.
+- The oval of an oval tag is drawn twice, as two closed chains of one-segment lines, not curves:
+  21 segments, then 34 (55 per oval, all 9 tags). The chains are different polygonizations of the
+  same ellipse, at most 0.14–0.24 pt apart, so they overlap visually but rarely exactly: within
+  0.05 pt, 0–2 segment pairs per oval overlap; within 0.2 pt, 37–40 pairs (52–55 of 55 segments).
+  All overlaps are between the two chains, never within a chain. The duplicate chain breaks linemerge
+  and polygonize, so detect the oval as the cluster of segments around the number, or by its convex hull.
 
 Signatures (widths are this file's values; derive them per drawing):
 - Measurement: ticks are short 45° strokes of width 0.48 (about 4.3 × 4.3 pt on a horizontal line,
@@ -131,13 +135,21 @@ Signatures (widths are this file's values; derive them per drawing):
   23.5–75.4 pt, from the box edge (7) or the name bbox (3; one ends 2.2 pt below it) to the dot
   center. Dot: one `fs` path of 4 curves, black fill and stroke, 5.6–5.8 pt. 72 labels (69 distinct
   numbers), 10 with a leader, 10 dots on the page.
+- Oval tag: one contiguous run in drawing order: arrowhead, leader, oval chain (21 segments),
+  clip + white `re` (the number's mask), the oval again (34 segments). Black 0.36, level 0,
+  unclipped, except the mask. Arrowhead: one `fs` path of 3 `l` items (closed triangle, black
+  fill and stroke, first point is the tip), about 8.5 pt long with a 2.3 pt base. Not a clipped fill.
+  Leader: 1–2 one-segment lines (7 of 9 bent), 16.5–37.7 pt in total, from the tip to the oval's
+  right end (4) or 0.6–0.84 pt short of its top, bottom, or left (5). Mask: a clip of 21–25 `l` items
+  tracing the oval, then a level-1 white `re` of 25.4–25.6 × 14.2 pt. Number: one span, ArialNarrow
+  8.03 pt, black, horizontal. 9 oval tags on the page (108 ×4, 109 ×2, 110 ×2, 111). The other
+  2 black 3-line `fs` paths (width 0.24, top right) are not oval tags.
 
 Unverified (check before relying on them):
 - That all 91 strokes of width 1.92 are tag end bars.
 - That architecture never uses width 0.48 or 1.92.
 - That the 489 unclipped `re` fills (mostly white, some green, black, light blue) are real rectangles.
 - That the 1491 × 1491 pt black fill (clipped by a 163-segment polygon) is wall poché.
-- That oval tag arrowheads are clipped fills like ALIGN arrowheads.
 - That the 29 regular-weight, mostly 45°-rotated `NN-XNN` texts are door numbers (not room labels).
 - That room label leaders start only on the box or the name bbox.
 

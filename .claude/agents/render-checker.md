@@ -28,6 +28,10 @@ a wall in a short, very thick line with rounded ends. That end bar is part of th
 **ALIGN marker** (`align_marker.png`): a bracket with two solid arrowheads pointing at wall faces,
 and the text `ALIGN`.
 
+**Oval tag** (`oval_tag_*.png`): a number (e.g. `110`) inside an oval outline, with a leader (often
+bent once) ending in a solid black arrowhead that touches a wall or window. The oval, leader, and
+arrowhead are all annotation; the wall or window the arrowhead touches stays.
+
 **Grid lines**: long thin gray lines running across the drawing, such as the gray diagonal crossing
 `callout_circle.png`. They are annotation and must be gone.
 
@@ -38,7 +42,7 @@ a tag bar or a tick stay, and arrowheads touching a wall face are removed withou
 
 Not every arrow is an annotation: door and window direction marks (e.g. the small right-angle arrows in
 `dimension_leader.png`) are architecture. An arrow is an annotation only as part of a measurement,
-leader, or ALIGN marker.
+leader, ALIGN marker, or oval tag.
 
 ## Steps
 1. From the repo root, run `python -m data_eng.check_render <source.pdf> <drawing.pdf> --out <dir>`.

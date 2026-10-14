@@ -65,6 +65,16 @@ ROOM_NAME_CENTER_TOL = 1.0  # pt; name line center to box center, -0.20-0.11
 ROOM_DOT_MAX_RADIUS = 4.0  # pt; end dots are 2.82-2.88
 ROOM_LEADER_MAX_TURN = 90.0  # degrees; room leaders bend by 45-60
 
+# Oval tag grouping. Ranges in comments were measured in A-1-03-10.
+OVAL_NUMBER_RE = re.compile(r"\d+")  # whole text of an oval tag number, e.g. "110"
+OVAL_SEG_MAX_LEN = 5.0  # pt; oval segments are 1.33-3.85 pt long
+OVAL_MAX_GAP = 10.0  # pt; number bbox to oval, 2.7-7.3
+OVAL_RING_TOL = 0.5  # pt; oval segments to the convex hull outline of the oval, 0.0-0.043
+OVAL_MASK_TOL = 0.5  # pt; max difference between the number's mask bounds and the oval's (0.0)
+OVAL_HEAD_MAX_LEN = 12.0  # pt; longest side of an arrowhead triangle, 8.5-8.67
+OVAL_HEAD_MIN_ASPECT = 2.5  # arrowhead longest side / shortest side, 3.7-3.9
+OVAL_LEADER_MAX_TURN = 90.0  # degrees; oval tag leaders bend by 41-62
+
 
 def style_key(path: dict) -> tuple | None:
     """(color, width) of a get_drawings() path, rounded to 4 decimals; None if either is None."""
@@ -159,6 +169,17 @@ def room_label_json(group: dict) -> dict:
         "rect": [[round(float(x), 3), round(float(y), 3)] for x, y in corners],
         "leader_rect": group["leader_rect"],
         "dot": None if dot is None else [round(dot.x, 3), round(dot.y, 3)],
+        "items": group["items"],
+    }
+
+
+def oval_tag_json(group: dict) -> dict:
+    """An oval tag group with its rect as 4 [x, y] corners (pt, rounded to 3 decimals), for JSON."""
+    corners = shapely.get_coordinates(group["rect"].exterior)[:-1]
+    return {
+        "text": group["text"],
+        "rect": [[round(float(x), 3), round(float(y), 3)] for x, y in corners],
+        "leader_rect": group["leader_rect"],
         "items": group["items"],
     }
 
@@ -989,20 +1010,26 @@ class FloorPlanParser:
             f"a circle not in a callout"
         )
 
-    def _room_leader(
-        self, region: Polygon | MultiPolygon, edges: np.ndarray, dot_center: np.ndarray, dot_radius: np.ndarray
+    def _label_leader(
+        self,
+        region: Polygon | MultiPolygon,
+        exclude: np.ndarray,
+        target_center: np.ndarray,
+        target_radius: np.ndarray,
+        max_turn: float,
     ) -> tuple[list[int], int] | str | None:
-        """Leader from a room label's box or name lines (region) to an end dot: (leader segments,
-        dot), None if no chain reaches a dot, or a failure reason.
+        """Leader from a label (region: a room label's box and name lines, or an oval tag's oval) to
+        a target (an end dot or an arrowhead tip): (leader segments, target), None if no chain
+        reaches a target, or a failure reason.
 
-        Starts from every segment other than the box edges with an end within THRSH of region and
-        follows pieces joined end to end (_next_piece, ROOM_LEADER_MAX_TURN) until the free end lies
-        within a dot's radius plus JOIN_TOL. Chains ending anywhere else (walls, other annotations)
-        are ignored. All chains that reach a dot must reach the same one and be parts of the longest.
+        Starts from every segment not in exclude with an end within THRSH of region and follows
+        pieces joined end to end (_next_piece, max_turn degrees) until the free end lies within a
+        target's radius plus JOIN_TOL. Chains ending anywhere else (walls, other annotations) are
+        ignored. All chains that reach a target must reach the same one and be parts of the longest.
         """
         found = []
         for s in self.seg_tree.query(region, predicate="dwithin", distance=THRSH):
-            if s in edges:
+            if s in exclude:
                 continue
             ends = self.seg_xy[s]
             dist = shapely.distance(shapely.points(ends), region)
@@ -1012,16 +1039,16 @@ class FloorPlanParser:
             prev, free = ends[1 - far], ends[far]
             chain = [int(s)]
             for _ in range(LEADER_MAX_SEGS):
-                hit = np.flatnonzero(np.linalg.norm(dot_center - free, axis=1) <= dot_radius + JOIN_TOL)
+                hit = np.flatnonzero(np.linalg.norm(target_center - free, axis=1) <= target_radius + JOIN_TOL)
                 if len(hit) > 1:
-                    return f"leader ends on {len(hit)} dots"
+                    return f"leader ends on {len(hit)} targets"
                 if len(hit) == 1:
                     found.append((chain, int(hit[0])))
                     break
                 heading = math.degrees(math.atan2(free[1] - prev[1], free[0] - prev[0]))
                 near = self.seg_tree.query(shapely.points(free), predicate="dwithin", distance=JOIN_TOL)
-                near = near[~np.isin(near, np.concatenate([chain, edges]))]
-                j = self._next_piece(free, heading, near, ROOM_LEADER_MAX_TURN)
+                near = near[~np.isin(near, np.concatenate([chain, exclude]))]
+                j = self._next_piece(free, heading, near, max_turn)
                 if j is None:
                     break
                 chain.append(j)
@@ -1030,10 +1057,10 @@ class FloorPlanParser:
                 prev, free = free, ends[far]
         if not found:
             return None
-        chain, dot = max(found, key=lambda f: len(f[0]))
-        if any(fd != dot or not set(fc) <= set(chain) for fc, fd in found):
+        chain, target = max(found, key=lambda f: len(f[0]))
+        if any(ft != target or not set(fc) <= set(chain) for fc, ft in found):
             return f"{len(found)} possible leaders"
-        return chain, dot
+        return chain, target
 
     def get_room_labels(self) -> None:
         """Group each room label: number, name lines, number box, text masks, leader and end dot.
@@ -1047,10 +1074,10 @@ class FloorPlanParser:
         current top and its center within ROOM_NAME_CENTER_TOL of the box center. The number's
         mask is a fill matching the box within ROOM_MASK_TOL; name masks are found as in
         get_measurements; at most one per text. End dots are filled circles (circle_of) of radius
-        at most ROOM_DOT_MAX_RADIUS. The leader (_room_leader) is optional; a dot reached from
+        at most ROOM_DOT_MAX_RADIUS. The leader (_label_leader) is optional; a dot reached from
         more than one label leaves all of them unclassified.
 
-        Sets self.enc_labels, a list of {text, name, rect, leader_rect, dot, items}: rect is the
+        Sets self.enc_labels, a list of {kind ("room_label"), text, name, rect, leader_rect, dot, items}: rect is the
         minimum rotated rectangle of the box and name lines (Polygon), leader_rect the bounding
         [x0, y0, x1, y1] of the leader or None, dot the end dot's center (Point) or None, and
         items sorted indices into self.paths (page space, pt). Sets self.unclassified_room_labels,
@@ -1136,7 +1163,7 @@ class FloorPlanParser:
             leader = None
             if reason is None:
                 region = shapely.union_all([box, *self.word_bboxes[name]])
-                leader = self._room_leader(region, edges, dot_center, dot_radius)
+                leader = self._label_leader(region, edges, dot_center, dot_radius, ROOM_LEADER_MAX_TURN)
                 if isinstance(leader, str):
                     reason = leader
             if reason is not None:
@@ -1174,6 +1201,7 @@ class FloorPlanParser:
                 used_dots.add(dot)
             self.enc_labels.append(
                 {
+                    "kind": "room_label",
                     "text": text,
                     "name": " ".join(str(self.word_texts[t]) for t in name),
                     "rect": shapely.minimum_rotated_rectangle(shapely.union_all([box, *self.word_bboxes[name]])),
@@ -1190,14 +1218,181 @@ class FloorPlanParser:
             f"{len(dot_path) - len(used_dots)} of {len(dot_path)} end dots not in a label"
         )
 
+    def _index_oval_heads(self) -> None:
+        """Arrowhead candidates of oval tags: filled paths that are one closed triangle of 3 l items.
+
+        The longest side is at most OVAL_HEAD_MAX_LEN and at least OVAL_HEAD_MIN_ASPECT times the
+        shortest; the tip is the vertex opposite the shortest side. Sets oval_head_path (index into
+        self.paths), oval_head_tip (n, 2) and oval_head_angle (base midpoint to tip, degrees, page space).
+        """
+        head_path, tips, angles = [], [], []
+        for i, path in enumerate(self.paths):
+            items = path["items"]
+            if "f" not in path["type"] or len(items) != 3 or any(item[0] != "l" for item in items):
+                continue
+            starts = np.array([tuple(item[1]) for item in items])
+            ends = np.array([tuple(item[2]) for item in items])
+            if np.linalg.norm(ends - np.roll(starts, -1, axis=0), axis=1).max() > SUBPATH_TOL:
+                continue  # not one closed triangle
+            sides = np.linalg.norm(ends - starts, axis=1)  # side n runs from vertex n to vertex n + 1
+            if sides.max() > OVAL_HEAD_MAX_LEN or sides.max() < OVAL_HEAD_MIN_ASPECT * sides.min():
+                continue
+            n = int(sides.argmin())
+            base, tip = (starts[n] + ends[n]) / 2, starts[(n + 2) % 3]
+            head_path.append(i)
+            tips.append(tip)
+            angles.append(math.degrees(math.atan2(tip[1] - base[1], tip[0] - base[0])))
+        self.oval_head_path = np.array(head_path, dtype=int)
+        self.oval_head_tip = np.array(tips, dtype=float).reshape(-1, 2)
+        self.oval_head_angle = np.array(angles, dtype=float)
+
+    def _oval_segments(self, bbox: Polygon) -> np.ndarray:
+        """Segments of the closed chains around a text bbox: candidates for the oval of an oval tag.
+
+        Candidates are straight segments at most OVAL_SEG_MAX_LEN long, inside bbox inflated by
+        OVAL_MAX_GAP and not touching it. Segments with a free end (no other candidate's end within
+        JOIN_TOL) are dropped until none is left, which removes leader pieces and stray wall
+        pieces but keeps every closed chain, including chains drawn on top of each other.
+        """
+        search = shapely.box(*(np.array(bbox.bounds) + [-OVAL_MAX_GAP, -OVAL_MAX_GAP, OVAL_MAX_GAP, OVAL_MAX_GAP]))
+        cand = self.seg_tree.query(search, predicate="contains")
+        cand = cand[(self.seg_kind[cand] == "l") & (self.seg_len[cand] <= OVAL_SEG_MAX_LEN)]
+        cand = cand[~shapely.intersects(self.seg_geoms[cand], bbox)]
+        while len(cand):
+            ends = shapely.points(self.seg_xy[cand].reshape(-1, 2))  # ends 2n and 2n + 1 belong to cand[n]
+            ei, ej = STRtree(ends).query(ends, predicate="dwithin", distance=JOIN_TOL)
+            other = ei // 2 != ej // 2
+            joined = np.zeros(len(ends), dtype=bool)
+            joined[ei[other]] = True
+            free = ~joined.reshape(-1, 2).all(axis=1)
+            if not free.any():
+                break
+            cand = cand[~free]
+        return cand
+
+    def get_oval_tags(self) -> None:
+        """Group each oval tag: number, its mask, oval segments, leader and arrowhead.
+
+        The oval is the set of closed chains around a text line matching OVAL_NUMBER_RE
+        (_oval_segments) whose convex hull contains the text bbox, with every segment within
+        OVAL_RING_TOL of the hull outline. The oval is drawn twice with overlapping segments, so
+        no linemerge or polygonize. Text without such chains is not an oval tag. The number's mask
+        is a fill whose bounds match the hull's within OVAL_MASK_TOL. The leader (_label_leader,
+        OVAL_LEADER_MAX_TURN) runs from the oval to the tip of an arrowhead (_index_oval_heads), and
+        its last piece is parallel to the arrowhead (ANGLE_TOL). An arrowhead reached from more than
+        one oval leaves all of them unclassified. Membership is decided by geometry only.
+
+        Appends to self.enc_labels (so call get_room_labels() first) groups {kind ("oval_tag"),
+        text, rect, leader_rect, items}: rect is the minimum rotated rectangle of the oval (Polygon),
+        leader_rect the bounding [x0, y0, x1, y1] of the leader, and items sorted indices into
+        self.paths (page space, pt). Sets self.unclassified_oval_tags, a list of {text, bbox (the
+        oval's), reason}. Uses only self.paths and the text, so it does not need parse().
+        """
+        if not hasattr(self, "unclassified_room_labels"):
+            raise RuntimeError("call get_room_labels() before get_oval_tags()")
+        if any(g["kind"] == "oval_tag" for g in self.enc_labels):
+            raise RuntimeError("get_oval_tags() already ran")
+        self._index_segments()
+        self._index_masks()
+        self._index_oval_heads()
+        head_segs = np.array([s for p in self.oval_head_path for s in self.path_segs[int(p)]], dtype=int)
+
+        self.unclassified_oval_tags = []
+        numbers = np.flatnonzero([OVAL_NUMBER_RE.fullmatch(t) is not None for t in self.word_texts])
+        cands = []  # tags whose parts were all found, before arrowhead ownership and path checks
+        n_no_oval = 0
+        for k in numbers:
+            text, bbox = str(self.word_texts[k]), self.word_bboxes[k]
+            oval = self._oval_segments(bbox)
+            hull = shapely.convex_hull(shapely.multilinestrings(self.seg_geoms[oval])) if len(oval) else None
+            if hull is None or hull.geom_type != "Polygon" or not hull.contains(bbox):
+                n_no_oval += 1
+                continue
+            unclassified = {"text": text, "bbox": [round(float(v), 3) for v in hull.bounds]}
+            reason = None
+            off_ring = shapely.distance(self.seg_geoms[oval], hull.exterior).max()
+            if off_ring > OVAL_RING_TOL:
+                reason = f"segments around the number are not one oval ({off_ring:.2f} pt off its hull)"
+            elif self.word_angles[k] != 0:
+                reason = "number not horizontal"
+
+            masks: list[int] = []
+            if reason is None:
+                cand = self.mask_tree.query(hull, predicate="intersects")
+                off = np.abs(shapely.bounds(self.mask_polys[cand]) - np.array(hull.bounds)).reshape(-1, 4)
+                masks = self.mask_path[cand[off.max(axis=1, initial=0.0) <= OVAL_MASK_TOL]].tolist()
+                if len(masks) != 1:
+                    reason = f"{len(masks)} candidate masks {masks} for {text!r}"
+
+            leader = None
+            if reason is None:
+                exclude = np.concatenate([oval, head_segs])
+                tips = self.oval_head_tip
+                leader = self._label_leader(hull, exclude, tips, np.zeros(len(tips)), OVAL_LEADER_MAX_TURN)
+                if leader is None:
+                    reason = "no leader to an arrowhead"
+                elif isinstance(leader, str):
+                    reason = leader
+                elif angle_diff(self.seg_angle[leader[0][-1]], self.oval_head_angle[leader[1]]) > ANGLE_TOL:
+                    reason = "last leader piece not parallel to its arrowhead"
+            if reason is not None:
+                self.unclassified_oval_tags.append({**unclassified, "reason": reason})
+                continue
+            cands.append((text, unclassified, hull, oval, masks, leader))
+
+        reached = defaultdict(int)  # arrowhead -> ovals whose leader reaches it
+        for *_, (_, head) in cands:
+            reached[head] += 1
+        claimed: dict[int, str] = {}  # path index -> owner, for room labels and oval tags
+        for g in self.enc_labels:
+            claimed.update({p: f"room label {g['text']}" for p in g["items"]})
+        used_heads: set[int] = set()
+        n_groups = 0
+        for text, unclassified, hull, oval, masks, (chain, head) in cands:
+            if reached[head] > 1:
+                reason = f"arrowhead reached from {reached[head]} ovals"
+                self.unclassified_oval_tags.append({**unclassified, "reason": reason})
+                continue
+            paths, partial = self._group_paths(np.concatenate([oval, chain]).astype(int))
+            if partial:
+                reason = f"paths {partial} have items outside the group"
+                self.unclassified_oval_tags.append({**unclassified, "reason": reason})
+                continue
+            items = sorted(set(paths + masks + [int(self.oval_head_path[head])]))
+            taken = sorted({claimed[p] for p in items if p in claimed})
+            if taken:
+                reason = f"paths already used by {taken}"
+                self.unclassified_oval_tags.append({**unclassified, "reason": reason})
+                continue
+            claimed.update({p: f"oval tag at {unclassified['bbox']}" for p in items})
+            used_heads.add(head)
+            leader_paths = sorted({int(self.seg_path[s]) for s in chain})
+            self.enc_labels.append(
+                {
+                    "kind": "oval_tag",
+                    "text": text,
+                    "rect": shapely.minimum_rotated_rectangle(hull),
+                    "leader_rect": union_rect([self.paths[p]["rect"] for p in leader_paths]),
+                    "items": items,
+                }
+            )
+            n_groups += 1
+        print(
+            f"oval tags: {len(numbers)} {OVAL_NUMBER_RE.pattern!r} texts, {n_no_oval} without an oval, "
+            f"{n_groups} grouped, {len(self.unclassified_oval_tags)} unclassified; "
+            f"{len(self.oval_head_path) - len(used_heads)} of {len(self.oval_head_path)} arrowheads not in an oval tag"
+        )
+
     def draw(self, out_dir: Path) -> None:
         debug_dir = out_dir / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
         if not hasattr(self, "enc_labels"):
             raise RuntimeError("call get_room_labels() before draw()")
+        if not hasattr(self, "unclassified_oval_tags"):
+            raise RuntimeError("call get_oval_tags() before draw()")
         label_geoms = [g["rect"] for g in self.enc_labels]
         label_geoms += [shapely.box(*g["leader_rect"]) for g in self.enc_labels if g["leader_rect"] is not None]
-        label_geoms += [g["dot"] for g in self.enc_labels if g["dot"] is not None]
+        label_geoms += [g["dot"] for g in self.enc_labels if g["kind"] == "room_label" and g["dot"] is not None]
         display_geoms(self.page, label_geoms, debug_dir / "labels.pdf")
         display_geoms(self.page, self.grid_lines, debug_dir / "grid_lines.pdf")
 
@@ -1217,9 +1412,12 @@ class FloorPlanParser:
         tags = {i for group in self.tags for i in group["items"]}
         align = {i for group in self.align_markers for i in group["items"]}
         callouts = {i for group in self.callouts for i in group["items"]}
-        rooms = {i for group in self.enc_labels for i in group["items"]}
+        rooms = {i for group in self.enc_labels if group["kind"] == "room_label" for i in group["items"]}
+        ovals = {i for group in self.enc_labels if group["kind"] == "oval_tag" for i in group["items"]}
+        n_rooms = sum(group["kind"] == "room_label" for group in self.enc_labels)
         drop = [
-            g or i in meas or i in tags or i in align or i in callouts or i in rooms for i, g in enumerate(grid)
+            g or i in meas or i in tags or i in align or i in callouts or i in rooms or i in ovals
+            for i, g in enumerate(grid)
         ]
         remove_items(out[0], self.paths, drop, drop_text=True)
         out[0].set_cropbox(pymupdf.Rect(self.drawing_area.bounds))
@@ -1228,19 +1426,20 @@ class FloorPlanParser:
               f"measurement groups ({len(meas)} paths), {len(self.tags)} tags ({len(tags)} paths), "
               f"{len(self.align_markers)} ALIGN markers ({len(align)} paths), "
               f"{len(self.callouts)} callouts ({len(callouts)} paths), "
-              f"and {len(self.enc_labels)} room labels ({len(rooms)} paths), "
+              f"{n_rooms} room labels ({len(rooms)} paths), "
+              f"and {len(self.enc_labels) - n_rooms} oval tags ({len(ovals)} paths), "
               f"cropbox {tuple(round(v, 2) for v in out[0].cropbox)}")
         self.write_unclassified(out_dir / "unclassified.yaml")
         # TODO@Claude Remove the remaining annotations as whole groups: title block, legend, enclosing
-        # labels. (All text, grid lines, measurements, tags, ALIGN markers, callouts and room labels
-        # are done.)
+        # labels. (All text, grid lines, measurements, tags, ALIGN markers, callouts, room labels and
+        # oval tags are done.)
         # Delete specific drawing items; never redact a bbox. Unclassifiable items stay (unclassified.yaml).
         # Save the remaining primitive geoms in self.prim (label geometry stays in self.enc_labels).
 
 
     def write_unclassified(self, path: Path) -> None:
-        """Write the measurement texts, tags, ALIGN markers, callouts and room labels that could not
-        be grouped (left in the drawing) as YAML."""
+        """Write the measurement texts, tags, ALIGN markers, callouts, room labels and oval tags that
+        could not be grouped (left in the drawing) as YAML."""
         items = [
             {"kind": "measurement_text", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_measurements
@@ -1256,6 +1455,9 @@ class FloorPlanParser:
         ] + [
             {"kind": "room_label", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
             for u in self.unclassified_room_labels
+        ] + [
+            {"kind": "oval_tag", "text": u["text"], "bbox": u["bbox"], "reason": u["reason"]}
+            for u in self.unclassified_oval_tags
         ]
         doc = {
             "source": self.page.parent.name,
