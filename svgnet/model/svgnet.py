@@ -30,7 +30,7 @@ class SVGNet(nn.Module):
         coords,feats,semantic_labels,offsets,lengths,layerIds = batch
         return self._forward(coords,feats,offsets,semantic_labels,lengths,layerIds,return_loss=return_loss)
      
-    def prepare_targets(self,semantic_labels,bg_ind=-1,bg_sem=35):
+    def prepare_targets(self,semantic_labels,bg_ind=-1):
         
         instance_ids = semantic_labels[:,1].cpu().numpy()
         semantic_ids = semantic_labels[:,0].cpu().numpy()
@@ -45,7 +45,7 @@ class SVGNet(nn.Module):
         svg_len = semantic_ids.shape[0]
 
         for (sem_id,ins_id) in keys:
-            if sem_id==35 and ins_id==-1: continue # background
+            if sem_id==self.num_classes and ins_id==-1: continue # background
 
             tensor_mask = torch.zeros(svg_len)
             ind1 = np.where(semantic_ids==sem_id)[0]
@@ -55,7 +55,7 @@ class SVGNet(nn.Module):
             cls_targets.append(sem_id)
             mask_targets.append(tensor_mask.unsqueeze(1))
 
-        cls_targets = torch.tensor(cls_targets) if cls_targets else torch.tensor([35])
+        cls_targets = torch.tensor(cls_targets) if cls_targets else torch.tensor([self.num_classes])
         mask_targets = torch.cat(mask_targets,dim=1) if mask_targets else torch.zeros(svg_len,1)
         
         

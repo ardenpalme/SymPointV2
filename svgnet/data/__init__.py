@@ -4,7 +4,8 @@ from functools import partial
 
 from svgnet.util import worker_init_fn
 from .svg3 import SVGDataset
-__all__ = ["SVGDataset", "build_dataset"]
+from .archcad_categories import get_categories
+__all__ = ["SVGDataset", "build_dataset", "get_categories"]
 
 
 def build_dataset(data_cfg, logger):
@@ -12,6 +13,8 @@ def build_dataset(data_cfg, logger):
     _data_cfg = data_cfg.copy()
     _data_cfg["logger"] = logger
     data_type = _data_cfg.pop("type")
+    categories = _data_cfg.pop("categories", "floorplancad")
+    _data_cfg["bg_id"] = len(get_categories(categories)) - 1
     
     if data_type == "svg":
         return SVGDataset(**_data_cfg)

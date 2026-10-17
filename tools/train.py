@@ -12,7 +12,7 @@ import os.path as osp
 import shutil
 import time
 
-from svgnet.data import build_dataloader, build_dataset
+from svgnet.data import build_dataloader, build_dataset, get_categories
 from svgnet.model.svgnet import SVGNet as svgnet
 from svgnet.model.criterion import SetCriterion
 from svgnet.model.matcher import HungarianMatcher
@@ -113,8 +113,9 @@ def train(epoch, model, optimizer, scheduler, scaler, train_loader, cfg, logger,
 
 def validate(epoch, model, optimizer, val_loader, cfg, logger, writer):
     logger.info("Validation")
-    sem_point_eval = PointWiseEval(num_classes=cfg.model.semantic_classes,ignore_label=35,gpu_num=dist.get_world_size())
-    instance_eval = InstanceEval(num_classes=cfg.model.semantic_classes,ignore_label=35,gpu_num=dist.get_world_size())
+    categories = get_categories(cfg.data.test.get("categories", "floorplancad"))
+    sem_point_eval = PointWiseEval(num_classes=cfg.model.semantic_classes,ignore_label=cfg.model.semantic_classes,gpu_num=dist.get_world_size(),categories=categories)
+    instance_eval = InstanceEval(num_classes=cfg.model.semantic_classes,ignore_label=cfg.model.semantic_classes,gpu_num=dist.get_world_size(),categories=categories)
     meter_dict = {}
     torch.cuda.empty_cache()
     with torch.no_grad():

@@ -11,7 +11,7 @@ import os
 import os.path as osp
 import time
 from functools import partial
-from svgnet.data import build_dataloader, build_dataset
+from svgnet.data import build_dataloader, build_dataset, get_categories
 from svgnet.evaluation import PointWiseEval,InstanceEval
 from svgnet.model.svgnet import SVGNet as svgnet
 from svgnet.util  import get_root_logger, init_dist, load_checkpoint
@@ -26,6 +26,7 @@ def get_args():
     parser.add_argument("--seed", type=int, default=2000)
     parser.add_argument("--out", type=str, help="directory for output results")
     parser.add_argument("--save_lite", action="store_true")
+    parser.add_argument("--split", type=str, help="override cfg.data.test.split (e.g. val, test)")
     args = parser.parse_args()
     return args
 
@@ -82,12 +83,15 @@ def main():
     logger.info(f"Load state dict from {args.checkpoint}")
     load_checkpoint(args.checkpoint, logger, model)
 
+    if args.split:
+        cfg.data.test.split = args.split
     val_set = build_dataset(cfg.data.test, logger)
     dataloader = build_dataloader(args,val_set, training=False, dist=args.dist, **cfg.dataloader.test)
 
     time_arr = []
-    sem_point_eval = PointWiseEval(num_classes=cfg.model.semantic_classes,ignore_label=35,gpu_num=dist.get_world_size())
-    instance_eval = InstanceEval(num_classes=cfg.model.semantic_classes,ignore_label=35,gpu_num=dist.get_world_size())
+    categories = get_categories(cfg.data.test.get("categories", "floorplancad"))
+    sem_point_eval = PointWiseEval(num_classes=cfg.model.semantic_classes,ignore_label=cfg.model.semantic_classes,gpu_num=dist.get_world_size(),categories=categories)
+    instance_eval = InstanceEval(num_classes=cfg.model.semantic_classes,ignore_label=cfg.model.semantic_classes,gpu_num=dist.get_world_size(),categories=categories)
     
     with torch.no_grad():
         model.eval()

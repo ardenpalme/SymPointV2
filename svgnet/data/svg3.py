@@ -70,8 +70,9 @@ class SVGDataset(Dataset):
 
     CLASSES = tuple([x["name"] for x in SVG_CATEGORIES])
 
-    def __init__(self, data_root, split,data_norm,aug, repeat=1, logger=None):
+    def __init__(self, data_root, split,data_norm,aug, repeat=1, logger=None, bg_id=35):
         
+        self.bg_id = bg_id
         self.split = split
         self.data_norm = data_norm
         self.aug = aug
@@ -86,7 +87,7 @@ class SVGDataset(Dataset):
         return len(self.data_list)*self.repeat
     
     @staticmethod
-    def load(json_file,idx,min_points=2048):
+    def load(json_file,idx,min_points=2048,bg_id=35):
         data = json.load(open(json_file))
         width, height = data["width"], data["height"]
         coords = data["args"]
@@ -124,7 +125,7 @@ class SVGDataset(Dataset):
         feat[:num,6] = widths/np.max(widths)
 
         
-        semanticIds = np.full_like(coord[:,0],35) # bg sem id = 35
+        semanticIds = np.full_like(coord[:,0],bg_id) # bg sem id = 35 (FloorPlanCAD)
         seg = np.array(data["semanticIds"])
         semanticIds[:num] = seg
         semanticIds = semanticIds.astype(np.int64)
@@ -149,7 +150,7 @@ class SVGDataset(Dataset):
         
         data_idx = self.data_idx[idx % len(self.data_idx)]
         json_file = self.data_list[data_idx]
-        coord, feat, label,lengths,layerIds = SVGDataset.load(json_file,idx)
+        coord, feat, label,lengths,layerIds = SVGDataset.load(json_file,idx,bg_id=self.bg_id)
         
         if self.split=="train":
             return self.transform_train(coord, feat, label,layerIds)

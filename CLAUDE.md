@@ -11,7 +11,12 @@ Goal: run the `svgnet/` model, trained on FloorPlanCAD, on real A0 floor plan PD
    block, legend, grid lines, and all annotations) and write the remaining primitives as `*_s2.npz`.
    Labels come from `annotations/<pdf stem>.xml` (one CVAT XML per PDF, rotated boxes).
    Rules: `.claude/rules/data-eng.md`.
-4. **Sliding-window inference (not built)**: A0 pages are far larger than FloorPlanCAD tiles, so they are
+4. **ArchCAD (training data)**: raw slices in `/home/ubuntu/dataset/ArchCAD/data/{svg,json,png,...}` (read-only).
+   `archcad/make_split.py` -> `archcad/convert_archcad.py` -> `archcad/check_data.py` write and validate
+   `data/archcad/{train,val,test}/*_s2.json`. Train with `tools/train_archcad.sh`
+   (config `configs/svg/svg_pointT_archcad.yaml`: 30 classes, `Others` = bg 30). Class list:
+   `svgnet/data/archcad_categories.py`, selected by `data.*.categories` in the config.
+5. **Sliding-window inference (not built)**: A0 pages are far larger than FloorPlanCAD tiles, so they are
    split into overlapping windows and predictions are aggregated. A previous attempt (core cells plus
    margins, each instance owned by the cell containing its bbox center) did not work; cause unknown.
 
@@ -24,7 +29,9 @@ Goal: run the `svgnet/` model, trained on FloorPlanCAD, on real A0 floor plan PD
   or change a loader; if a task needs one, stop and ask.
 - The model was trained on FloorPlanCAD tiles: windows need comparable extent and primitive density.
 - Semantic ids are 0-based indices into `SVG_CATEGORIES` (35 = background), not its 1-based `id` field.
-  Instance id < 0 means no instance. The class list is duplicated across files; never change it.
+  Instance id < 0 means no instance. The FloorPlanCAD class list is duplicated across files; never change it.
+  Class count and bg id come from the config (`model.semantic_classes`, `data.*.categories`); defaults keep
+  FloorPlanCAD behaviour.
 - If the PDF pipeline and the model disagree, stop and ask. Never patch the model or loaders to fit.
 
 ## Environment
@@ -38,6 +45,8 @@ Goal: run the `svgnet/` model, trained on FloorPlanCAD, on real A0 floor plan PD
 - Lint: `ruff check <files you changed>`. Run `ruff format` only on files you created.
 - No test suite or type checker yet. Don't invent commands for them. <!-- TODO -->
 - Training and testing: `tools/train_dist.sh`, `tools/test_dist.sh`, on the Slurm cluster. <!-- TODO: args -->
+- ArchCAD training on this machine (1x L40): `bash tools/train_archcad.sh`; test split:
+  `torchrun --nproc_per_node=1 tools/test.py <work_dir>/svg_pointT_archcad.yaml <work_dir>/best.pth --dist --split test`.
 
 ## Boundaries
 - Never launch training, inference, or Slurm jobs, or rebuild the CUDA ops. Give me the command instead.

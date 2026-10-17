@@ -159,7 +159,7 @@ class Decoder(nn.Module):
         query_feats, query_poses = [], []
         dn_args = []
         for i,(label, mask) in enumerate(zip(tgt_labels, tgt_masks)):
-            if label>=35: continue
+            if label>=self.num_classes: continue
             dn_args.append(i)
             query_feat = self.label_enc(label).unsqueeze(0)
             query_feats.append(query_feat)
@@ -195,7 +195,7 @@ class Decoder(nn.Module):
         query_feats, query_poses = [], []
         dn_args = []
         for i,(label, mask) in enumerate(zip(tgt_labels, tgt_masks)):
-            if label>=35: continue
+            if label>=self.num_classes: continue
             dn_args.append(i)
             query_feat = self.label_enc(label).unsqueeze(0)
             query_feats.append(query_feat)

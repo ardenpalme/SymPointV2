@@ -4,6 +4,9 @@
 #include <torch/serialize/tensor.h>
 #include <ATen/cuda/CUDAContext.h>
 
+// Max neighbours per query: the kernel keeps them in per-thread arrays of this size.
+#define KNN_MAX_NSAMPLE 256
+
 void knnquery_cuda(int m, int nsample, at::Tensor xyz_tensor, at::Tensor new_xyz_tensor, at::Tensor offset_tensor, at::Tensor new_offset_tensor, at::Tensor idx_tensor, at::Tensor dist2_tensor);
 
 #ifdef __cplusplus

@@ -4,14 +4,15 @@ import torch
 import torch.distributed as dist
 
 class PointWiseEval(object):
-    def __init__(self, num_classes=35, ignore_label=35,gpu_num=1) -> None:
+    def __init__(self, num_classes=35, ignore_label=35,gpu_num=1,categories=None) -> None:
+        categories = SVG_CATEGORIES if categories is None else categories
         self.ignore_label = ignore_label
         self._num_classes = num_classes
         self._conf_matrix = np.zeros((self._num_classes + 1, self._num_classes + 1), dtype=np.float32)
         self._b_conf_matrix = np.zeros(
             (self._num_classes + 1, self._num_classes + 1), dtype=np.int64
         )
-        self._class_names = [x["name"] for x in SVG_CATEGORIES[:-1]]
+        self._class_names = [x["name"] for x in categories[:-1]]
         self.gpu_num = gpu_num
         
     def update(self, pred_sem, gt_sem):
@@ -67,11 +68,13 @@ class PointWiseEval(object):
 class InstanceEval(object):
     def __init__(self, num_classes=35,
                  ignore_label=35,
-                 gpu_num=8) -> None:
+                 gpu_num=8,
+                 categories=None) -> None:
 
+        categories = SVG_CATEGORIES if categories is None else categories
         self.ignore_label = ignore_label
         self._num_classes = num_classes
-        self._class_names = [x["name"] for x in SVG_CATEGORIES[:-1]]
+        self._class_names = [x["name"] for x in categories[:-1]]
         self.gpu_num = gpu_num
         self.min_obj_score = 0.1
         self.IoU_thres = 0.5
@@ -80,8 +83,8 @@ class InstanceEval(object):
         self.tp_classes_values = np.zeros(num_classes)
         self.fp_classes = np.zeros(num_classes)
         self.fn_classes = np.zeros(num_classes)
-        self.thing_class = [i for i in range(30)]
-        self.stuff_class = [30,31,32,33,34]
+        self.thing_class = [i for i, x in enumerate(categories[:-1]) if x["isthing"]]
+        self.stuff_class = [i for i, x in enumerate(categories[:-1]) if not x["isthing"]]
 
     def update(self, instances, target, lengths):
         
