@@ -4,6 +4,5 @@ annotations/
 __pycache__/
 *.py[cod]
 scratch/
-data/
 modules/pointops/**
 work_dirs/

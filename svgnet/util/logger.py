@@ -1,6 +1,4 @@
-from tensorboardX import SummaryWriter as _SummaryWriter
-
-import logging
+import os, logging
 from .dist import is_main_process, master_only
 
 
@@ -22,15 +20,29 @@ def get_root_logger(log_file=None, log_level=logging.INFO):
     return logger
 
 
-class SummaryWriter(_SummaryWriter):
-    @master_only
-    def __init__(self, *args, **kwargs):
-        return super().__init__(*args, **kwargs)
+class SummaryWriter:
+    """The tensorboardX SummaryWriter calls train.py makes, logged to wandb instead.
+
+    Resumes the run in $WANDB_RUN_ID (ml_pipe's finetune_spv2.py creates it with the provenance);
+    without one, starts a new run in $WANDB_PROJECT. Scalars are plotted against "epoch".
+    wandb is imported here, not at module level: svgnet.model imports this module on the inference path.
+    """
 
     @master_only
-    def add_scalar(self, *args, **kwargs):
-        return super().add_scalar(*args, **kwargs)
+    def __init__(self, log_dir=None):
+        import wandb
+
+        run_id = os.environ.get("WANDB_RUN_ID")
+        self._run = wandb.init(project=os.environ.get("WANDB_PROJECT"), id=run_id,
+                               resume="must" if run_id else None, dir=log_dir)
+        self._run.define_metric("epoch")
+        self._run.define_metric("train/*", step_metric="epoch")
+        self._run.define_metric("val/*", step_metric="epoch")
 
     @master_only
-    def flush(self, *args, **kwargs):
-        return super().flush(*args, **kwargs)
+    def add_scalar(self, tag, scalar_value, global_step):
+        self._run.log({tag: scalar_value, "epoch": global_step})
+
+    @master_only
+    def flush(self):
+        pass  # wandb flushes on its own; train.py calls this once per epoch
